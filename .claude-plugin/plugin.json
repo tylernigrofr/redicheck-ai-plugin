@@ -1,0 +1,11 @@
+{
+  "name": "redicheck-ai",
+  "version": "0.1.0",
+  "description": "RediCheck QC for construction documents — spec-check and drawing-index-qc using the RediCheck methodology.",
+  "author": {
+    "name": "The RediCheck Firm, LLC",
+    "email": "bnigro@RediCheck.biz"
+  },
+  "homepage": "https://www.RediCheck-Review.com",
+  "keywords": ["construction", "architecture", "coordination", "QC", "drawing-review", "redicheck"]
+}

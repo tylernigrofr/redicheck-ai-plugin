@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.venv/
+.env
+.env.local
+.env.*.local
+*.sqlite
+qc.sqlite
+tests/local_paths.py
+.deploy-keys/

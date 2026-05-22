@@ -1,0 +1,17 @@
+{
+  "description": "Ensure qc_core venv on session start (ADR-0017)",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/ensure_venv.py\"",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
+  }
+}

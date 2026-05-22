@@ -1,0 +1,14 @@
+{
+  "name": "redicheck-ai",
+  "owner": {
+    "name": "The RediCheck Firm, LLC",
+    "email": "bnigro@RediCheck.biz"
+  },
+  "plugins": [
+    {
+      "name": "redicheck-ai",
+      "source": "./",
+      "description": "RediCheck spec-check and drawing-index-qc for Claude Desktop. Indexes PDFs locally, previews findings, emits PyMuPDF markups for Revu triage."
+    }
+  ]
+}
