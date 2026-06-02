@@ -69,7 +69,11 @@ def detect_section_format(pdf_path: Path | str, toc_start: int, toc_end: int) ->
 _SUBJECT_BY_KIND = {
     "broken_related_ref": f"{SUBJECT_PREFIX}:broken-related-ref",
     "body_not_in_toc": f"{SUBJECT_PREFIX}:body-not-in-toc",
+    "toc_not_in_body": f"{SUBJECT_PREFIX}:toc-not-in-body",
+    "section_number_mismatch": f"{SUBJECT_PREFIX}:section-number-mismatch",
     "division_referenced_but_not_included": f"{SUBJECT_PREFIX}:division-excluded",
+    "duplicate_section_number": f"{SUBJECT_PREFIX}:duplicate-section-number",
+    "duplicate_section_number_and_name": f"{SUBJECT_PREFIX}:duplicate-section-number-and-name",
 }
 _DIVISION_MISSING_SUBJECT = f"{SUBJECT_PREFIX}:division-missing-from-toc"
 
@@ -236,6 +240,20 @@ def build_manifest(
                 "idempotency_key": f"{subject}|{missing}|anchor:{anchor}",
             })
 
+        elif kind == "toc_not_in_body":
+            section = r["section"] or ""
+            anchor_page = r["toc_page"] or _toc_start(conn, volume_id)
+            terms = section_variants(section)
+            comment = f"CNL section {format_section(section, fmt)} in body"
+            entries.append({
+                "kind": kind,
+                "subject": subject,
+                "comment": comment,
+                "page": anchor_page,
+                "search_terms": terms,
+                "idempotency_key": f"{subject}|{section}|toc:{anchor_page}",
+            })
+
         elif kind == "division_referenced_but_not_included":
             toc_start, toc_end = _toc_range(conn, volume_id)
             div = r["division"]
@@ -248,6 +266,41 @@ def build_manifest(
                 "pages": list(range(toc_start, toc_end + 1)),
                 "search_terms": anchor_terms,
                 "idempotency_key": f"{subject}|div{div}",
+            })
+
+        elif kind == "section_number_mismatch":
+            # Mark the mis-numbered body header (r["section"]); the correct
+            # number from the TOC is in probable_match.
+            body_num = r["section"] or ""
+            correct = r["probable_match"] or ""
+            comment = (
+                f"Section number {format_section(body_num, fmt)} should be "
+                f"{format_section(correct, fmt)}"
+            )
+            entries.append({
+                "kind": kind,
+                "subject": subject,
+                "comment": comment,
+                "page": r["body_page"],
+                "search_terms": section_variants(body_num),
+                "idempotency_key": f"{subject}|{body_num}->{correct}",
+            })
+
+        elif kind in ("duplicate_section_number", "duplicate_section_number_and_name"):
+            section = r["section"] or ""
+            and_name = kind == "duplicate_section_number_and_name"
+            anchor_page = r["toc_page"] or _toc_start(conn, volume_id)
+            comment = (
+                f"Duplicate section number{' and name' if and_name else ''} "
+                f"{format_section(section, fmt)}"
+            )
+            entries.append({
+                "kind": kind,
+                "subject": subject,
+                "comment": comment,
+                "page": anchor_page,
+                "search_terms": section_variants(section),
+                "idempotency_key": f"{subject}|{section}",
             })
 
     for div in sorted(rolled_divisions):
@@ -311,8 +364,9 @@ _LINE_HEIGHT = 18.0
 _BOX_PAD = 6.0
 _STACK_GAP = 2.0
 _GAP = 8.0
-_RED = (0.85, 0.10, 0.10)
-_RED_HEX = "#D91A1A"
+_RED = (1.0, 0.0, 0.0)  # Bluebeam default "Red" swatch
+_RED_HEX = "#FF0000"
+_WHITE = (1.0, 1.0, 1.0)
 _MARGIN = 4.0
 
 
@@ -323,7 +377,7 @@ def _box_size_for(comment: str) -> tuple[float, float]:
     width = _BOX_W
     text = comment or ""
     inner_w = width - 2 * _BOX_PAD
-    text_w = fitz.get_text_length(text, fontname="helv", fontsize=_FONT_SIZE)
+    text_w = fitz.get_text_length(text, fontname="hebo", fontsize=_FONT_SIZE)
     lines = max(1, int(-(-text_w // inner_w)))  # ceil division
     height = lines * _LINE_HEIGHT + 2 * _BOX_PAD
     return width, max(_BOX_H, height)
@@ -374,8 +428,8 @@ def _rich_text_payload(comment: str, font_size: float, color_hex: str) -> tuple[
     explicit rich-text source so the appearance stays stable.
     """
     ds = (
-        f"font: {font_size:g}pt 'Helvetica',sans-serif; "
-        f"text-align:left; color:{color_hex}"
+        f"font: bold {font_size:g}pt 'Helvetica-Bold',sans-serif; "
+        f"font-weight:bold; text-align:left; color:{color_hex}"
     )
     safe = html.escape(comment or "")
     rc = (
@@ -384,7 +438,8 @@ def _rich_text_payload(comment: str, font_size: float, color_hex: str) -> tuple[
         'xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" '
         'xfa:APIVersion="Acrobat:11.0.0" xfa:spec="2.0.2">'
         '<p dir="ltr">'
-        f'<span style="font-size:{font_size:g}pt;font-family:Helvetica;color:{color_hex}">'
+        f'<span style="font-size:{font_size:g}pt;font-family:Helvetica-Bold;'
+        f'font-weight:bold;color:{color_hex}">'
         f'{safe}'
         '</span></p></body>'
     )
@@ -456,8 +511,11 @@ def emit_to_pdf(
                 box,
                 entry.get("comment", ""),
                 fontsize=_FONT_SIZE,
-                fontname="Helv",
+                fontname="HeBo",  # Helvetica-Bold
                 text_color=_RED,
+                # Solid white box at full opacity so red text stays legible over
+                # underlying linework/text (opacity stays global-opaque per #46).
+                fill_color=_WHITE,
                 align=fitz.TEXT_ALIGN_LEFT,
             )
             annot.set_border(width=0)

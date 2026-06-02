@@ -58,8 +58,10 @@ finishes in well under 5 seconds.
 |---|---|---|
 | `broken_related_ref` | Squiggly | Bad reference text |
 | `body_not_in_toc` | Squiggly | Alphabetically-adjacent TOC section (ADR-0011) |
+| `section_number_mismatch` | Squiggly | Mis-numbered body header (title matches TOC, number differs — #44) |
 | `division_referenced_but_not_included` | Highlight | `TABLE OF CONTENTS` header |
 | `title_mismatch_across_volumes` | — | `info_only`; preview only, no markup emitted |
+| `embedded_report_present` | — | `info_only`; preview only — bound-in non-CSI report (#43), not a defect |
 
 All markups carry `Author = <reviewer>`, `Subject = "spec-check:<kind>"`, and a
 populated `Comments` field — the structure Reviewer triage relies on.

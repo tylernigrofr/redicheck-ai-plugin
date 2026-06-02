@@ -269,11 +269,28 @@ def _format_finding(row: dict) -> str:
             f"  [info] {row.get('from_section')} -> {row.get('to_section')} "
             f"(p.{row.get('source_page')}) [aggregated]"
         )
+    if kind == "embedded_report_present":
+        return (
+            f"  [info] {row['section']} — {row.get('title') or ''} "
+            f"(TOC p.{row.get('toc_page')}, report p.{row.get('body_page')}) "
+            f"[embedded non-CSI report, present]"
+        )
     if kind == "title_mismatch_across_volumes":
         return (
             f"  [{row.get('severity', 'low')}] {row['section']} — "
             f"{row.get('title') or ''} (TOC p.{row.get('toc_page')}) "
             f"{row.get('notes') or ''}"
+        ).rstrip()
+    if kind == "section_number_mismatch":
+        return (
+            f"  [{row.get('severity', 'high')}] {row['section']} should be "
+            f"{row.get('probable_match')} — {row.get('title') or ''} "
+            f"(body p.{row.get('body_page')}, TOC p.{row.get('toc_page')})"
+        ).rstrip()
+    if kind in ("duplicate_section_number", "duplicate_section_number_and_name"):
+        return (
+            f"  [{row.get('severity', 'medium')}] {row['section']} "
+            f"(TOC p.{row.get('toc_page')}) {row.get('notes') or ''}"
         ).rstrip()
     return f"  {kind}: {row}"
 

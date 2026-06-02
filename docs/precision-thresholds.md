@@ -117,7 +117,7 @@ Per-kind action when below threshold:
 
 These don't show up in the FP/FN table because the curation matched them, but they're worth carrying forward when the next precision measurement happens:
 
-- **AVW section-number near-miss splitting.** A human-perceived AVW like Quarry Oaks' `10 28 13 (TOC) / 10 28 00 (body)` surfaces under the current kinds as two separate findings (`toc_not_in_body` + `body_not_in_toc`). One logical issue, two markups. Not a precision problem against the current corpus — but if a future project has many such pairs, the inflated markup count is real reviewer cost. A `section_number_variance` kind would fuse them; defer until the corpus shows the cost.
+- ~~**AVW section-number near-miss splitting.**~~ *Resolved by #44.* A human-perceived AVW like Quarry Oaks' `10 28 13 (TOC) / 10 28 00 (body)` previously surfaced as two separate findings (`toc_not_in_body` + `body_not_in_toc`). The `section_number_mismatch` kind now fuses any TOC-only / body-only orphan pair sharing a normalized title into one finding ("Section number 10 28 00 should be 10 28 13").
 
 - **Broken-ref mentions misread as body sections.** Quarry Oaks' `31 20 00` "Earth Moving" came from this — the body extractor picked up an in-text mention of a referenced section number and treated it as a section header. Kadlec has a different class of the same kind of bug (TOC running-header artifacts, also documented in its `expected.json` as `suppress`). Worth investigating whether the body-section detector can use surrounding-line layout signals to filter these.
 

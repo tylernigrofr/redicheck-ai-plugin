@@ -16,6 +16,7 @@ from qc_core.spec.parse import (
     analyze_pdf,
     is_admin,
     is_by_consultant,
+    normalize_title_for_dup,
     titles_similar,
 )
 
@@ -87,6 +88,7 @@ def index_spec_pdf(
         volume_id = existing["id"]
         conn.execute("DELETE FROM spec_related_refs WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM spec_sections WHERE volume_id = ?", (volume_id,))
+        conn.execute("DELETE FROM embedded_reports WHERE volume_id = ?", (volume_id,))
         conn.execute(
             """
             UPDATE spec_volumes
@@ -124,10 +126,25 @@ def index_spec_pdf(
     for sec in result["body_sections"]:
         conn.execute(
             """
-            INSERT INTO spec_sections (volume_id, number, title, source, page)
-            VALUES (?, ?, ?, 'body', ?)
+            INSERT INTO spec_sections (volume_id, number, title, source, page, occurrence)
+            VALUES (?, ?, ?, 'body', ?, ?)
             """,
-            (volume_id, sec["number"], sec.get("title"), sec.get("page")),
+            (
+                volume_id,
+                sec["number"],
+                sec.get("title"),
+                sec.get("page"),
+                sec.get("occurrence", 1),
+            ),
+        )
+
+    for rep in result.get("embedded_reports", []):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO embedded_reports (volume_id, number, title, page)
+            VALUES (?, ?, ?, ?)
+            """,
+            (volume_id, rep["number"], rep.get("title"), rep.get("page")),
         )
 
     for ref in result["related_refs"]:
@@ -189,10 +206,17 @@ def _rebuild_toc_classes(
         for sec in rep_toc:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO toc_class_sections (toc_class_id, number, title, toc_page)
-                VALUES (?, ?, ?, ?)
+                INSERT OR IGNORE INTO toc_class_sections
+                    (toc_class_id, number, title, toc_page, occurrence)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (class_id, sec["number"], sec.get("title"), sec.get("toc_page")),
+                (
+                    class_id,
+                    sec["number"],
+                    sec.get("title"),
+                    sec.get("toc_page"),
+                    sec.get("occurrence", 1),
+                ),
             )
         for vol_id in member_vol_ids:
             conn.execute(
@@ -309,11 +333,52 @@ def compute_project_findings(
     body_nums = {n for n in body_by_num if not is_admin(n)}
     all_known = set(toc_by_num) | set(body_by_num)
 
+    # Mis-numbered sections (#44): a body header whose title matches a TOC entry
+    # but whose number differs is a single mis-numbering defect, not a pair of
+    # orphans (toc_not_in_body + body_not_in_toc). Detect by normalized-title
+    # match and suppress both orphans in favor of one section_number_mismatch.
+    mismatch_toc_nums, mismatch_body_nums = _detect_section_number_mismatches(
+        conn, toc_by_num, body_by_num, toc_nums, body_nums
+    )
+
+    # Embedded non-CSI reports confirmed present via the PDF outline (#43): keyed
+    # by number -> a representative (volume_id, page). Such a report is listed in
+    # the TOC but has no CSI body header, so it would otherwise be a false
+    # toc_not_in_body. When the outline confirms it is bound in, downgrade.
+    embedded_present: dict[str, sqlite3.Row] = {}
+    for r in conn.execute(
+        "SELECT volume_id, number, title, page FROM embedded_reports"
+    ).fetchall():
+        embedded_present.setdefault(r["number"], r)
+
     # toc_not_in_body (split out toc_by_consultant as info_only — not emitted)
-    for num in sorted(toc_nums - body_nums):
+    for num in sorted(toc_nums - body_nums - mismatch_toc_nums):
         row = toc_by_num[num]
         title = row["title"] or ""
         if is_by_consultant(title):
+            continue
+        if num in embedded_present:
+            rep = embedded_present[num]
+            conn.execute(
+                """
+                INSERT INTO findings (
+                    volume_id, kind, expected_action, severity,
+                    section, title, toc_page, body_page, notes
+                ) VALUES (?, 'embedded_report_present', 'info_only', 'low',
+                          ?, ?, ?, ?, ?)
+                """,
+                (
+                    rep["volume_id"],
+                    num,
+                    title,
+                    row["toc_page"],
+                    rep["page"],
+                    "Embedded non-CSI document (e.g. a bound-in report) — listed "
+                    "in the TOC and confirmed present in the set via the PDF "
+                    "outline; has no CSI section body by design, so not a "
+                    "toc_not_in_body defect.",
+                ),
+            )
             continue
         conn.execute(
             """
@@ -326,7 +391,7 @@ def compute_project_findings(
 
     # body_not_in_toc
     body_divs = {_division_of(n) for n in body_nums}
-    for num in sorted(body_nums - toc_nums):
+    for num in sorted(body_nums - toc_nums - mismatch_body_nums):
         row = body_by_num[num]
         conn.execute(
             """
@@ -418,6 +483,155 @@ def compute_project_findings(
                     r["context_line"],
                 ),
             )
+
+    _detect_duplicate_section_numbers(conn)
+
+
+def _detect_section_number_mismatches(
+    conn: sqlite3.Connection,
+    toc_by_num: dict[str, sqlite3.Row],
+    body_by_num: dict[str, sqlite3.Row],
+    toc_nums: set[str],
+    body_nums: set[str],
+) -> tuple[set[str], set[str]]:
+    """Pair a TOC-only section with a body-only section sharing its title (#44).
+
+    When a body header carries the wrong CSI number but the right title (e.g.
+    "CONCRETE CURING" at 03 60 00, where the TOC lists it as 03 39 00), the
+    generic diff yields two orphans. Match them by normalized title and emit a
+    single `section_number_mismatch`; return the (toc_nums, body_nums) that the
+    caller should drop from the toc_not_in_body / body_not_in_toc buckets.
+
+    Only unambiguous 1:1 title matches are paired — if a title resolves to more
+    than one orphan on either side, both are left as plain orphans.
+    """
+    toc_only = toc_nums - body_nums
+    body_only = body_nums - toc_nums
+
+    body_by_title: dict[str, list[str]] = {}
+    for num in body_only:
+        t = normalize_title_for_dup(body_by_num[num]["title"] or "")
+        if t:
+            body_by_title.setdefault(t, []).append(num)
+
+    matched_toc: set[str] = set()
+    matched_body: set[str] = set()
+    for toc_num in sorted(toc_only):
+        t = normalize_title_for_dup(toc_by_num[toc_num]["title"] or "")
+        if not t:
+            continue
+        candidates = body_by_title.get(t, [])
+        if len(candidates) != 1:
+            continue  # ambiguous (or none) — leave as orphans
+        body_num = candidates[0]
+        if body_num in matched_body:
+            continue
+        matched_toc.add(toc_num)
+        matched_body.add(body_num)
+
+        trow = toc_by_num[toc_num]
+        brow = body_by_num[body_num]
+        title = (trow["title"] or brow["title"] or "").strip()
+        notes = (
+            f'Section title "{title}" is numbered {body_num} in the body '
+            f'(p.{brow["page"]}) but {toc_num} in the TOC (p.{trow["toc_page"]}). '
+            f"Body section number is likely wrong; should be {toc_num}."
+        )
+        conn.execute(
+            """
+            INSERT INTO findings (
+                volume_id, kind, expected_action, severity,
+                section, title, body_page, toc_page, probable_match, notes
+            ) VALUES (?, 'section_number_mismatch', 'emit_markup', 'high',
+                      ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                brow["volume_id"],
+                body_num,
+                title,
+                brow["page"],
+                trow["toc_page"],
+                toc_num,
+                notes,
+            ),
+        )
+    return matched_toc, matched_body
+
+
+def _detect_duplicate_section_numbers(conn: sqlite3.Connection) -> None:
+    """Flag CSI section numbers reused by two distinct sections in a volume's
+    body (#45). Same normalized title -> duplicate_section_number_and_name
+    (high); differing titles -> duplicate_section_number (medium). Anchored on
+    the TOC page (where reviewers mark it) when the number is listed there."""
+    rows = conn.execute(
+        """
+        SELECT volume_id, number, title, page, occurrence
+        FROM spec_sections
+        WHERE source = 'body'
+        ORDER BY volume_id, number, occurrence
+        """
+    ).fetchall()
+
+    by_vol_num: dict[tuple[int, str], list[sqlite3.Row]] = {}
+    for r in rows:
+        by_vol_num.setdefault((r["volume_id"], r["number"]), []).append(r)
+
+    toc_page_by_num: dict[str, int] = {}
+    toc_titles_by_num: dict[str, list[str]] = {}
+    for r in conn.execute(
+        "SELECT number, title, toc_page FROM toc_class_sections"
+    ).fetchall():
+        if r["toc_page"] is not None:
+            toc_page_by_num.setdefault(r["number"], r["toc_page"])
+        toc_titles_by_num.setdefault(r["number"], []).append((r["title"] or "").strip())
+
+    for (volume_id, number), occs in by_vol_num.items():
+        if len(occs) < 2 or is_admin(number):
+            continue
+        body_titles = [(o["title"] or "").strip() for o in occs]
+        toc_titles = [t for t in toc_titles_by_num.get(number, []) if t]
+        # Classify by the TOC titles when the number is listed there more than
+        # once (that's what reviewers read); the two body SECTION-header lines
+        # are often identical even when the TOC entries differ. Fall back to the
+        # body titles when the TOC doesn't list the number twice.
+        if len(toc_titles) >= 2:
+            naming_titles = toc_titles
+        else:
+            naming_titles = [t for t in body_titles if t]
+        same_name = len({normalize_title_for_dup(t) for t in naming_titles}) <= 1
+        kind = (
+            "duplicate_section_number_and_name"
+            if same_name
+            else "duplicate_section_number"
+        )
+        severity = "high" if same_name else "medium"
+        pages = ", ".join(f"p.{o['page']}" for o in occs)
+        shown_titles = toc_titles if len(toc_titles) >= 2 else body_titles
+        title_list = " / ".join(f'"{t}"' for t in shown_titles if t) or "(untitled)"
+        label = "and name " if same_name else ""
+        notes = (
+            f"Duplicate section number {label}{number}: {len(occs)} body sections "
+            f"({pages}) — {title_list}."
+        )
+        toc_page = toc_page_by_num.get(number)
+        conn.execute(
+            """
+            INSERT INTO findings (
+                volume_id, kind, expected_action, severity,
+                section, title, body_page, toc_page, notes
+            ) VALUES (?, ?, 'emit_markup', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                volume_id,
+                kind,
+                severity,
+                number,
+                body_titles[0] or None,
+                occs[0]["page"],
+                toc_page,
+                notes,
+            ),
+        )
 
 
 def index_project(

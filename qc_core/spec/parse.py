@@ -249,6 +249,60 @@ def _detect_toc_from_outline(doc) -> Optional[tuple[int, int]]:
     return (toc_page_0, min(next_page_0 - 1, n - 1))
 
 
+_BOOKMARK_NUMBER_RE = re.compile(r"^\s*(\d{2}[\s.]\d{2}[\s.]\d{2}(?:\.\d+)?)\s+(.*)$")
+
+
+def detect_embedded_reports(doc) -> list[dict]:
+    """Embedded non-CSI documents that are bound into the set (#43).
+
+    A report like a Geotechnical Engineering Report appears in the spec TOC but
+    has no ``SECTION NN NN NN`` CSI body header, so the TOC↔body diff would flag
+    it as a false ``toc_not_in_body``. We recognize it from the PDF outline: a
+    bookmark whose title carries a CSI number and whose subtree contains the
+    document's own ``Table of Contents`` (the same nested-TOC signal #40/#41
+    use to skip embedded sub-document TOCs). The bookmark's presence confirms
+    the report is actually bound in.
+
+    Returns ``[{"number", "title", "page"}]`` (1-based page) for each confirmed
+    embedded report. Reports listed in the TOC but absent from the outline are
+    not returned — they stay genuine "missing from set" findings.
+    """
+    try:
+        outline = doc.get_toc(simple=True)
+    except Exception:
+        return []
+    if not outline:
+        return []
+
+    found: dict[str, dict] = {}
+    for idx, (level, title, page) in enumerate(outline):
+        if not title or page <= 0:
+            continue
+        m = _BOOKMARK_NUMBER_RE.match(title.strip())
+        if not m:
+            continue
+        norm = normalize_section_num(m.group(1))
+        if not norm or not is_valid_csi_number(norm):
+            continue
+        report_title = m.group(2).strip()
+
+        # Subtree = following entries deeper than this bookmark.
+        has_nested_toc = False
+        for level2, title2, _page2 in outline[idx + 1 :]:
+            if level2 <= level:
+                break
+            if title2 and _bookmark_looks_like_toc(title2):
+                has_nested_toc = True
+                break
+        if not has_nested_toc:
+            continue
+        found.setdefault(
+            norm, {"number": norm, "title": report_title, "page": page}
+        )
+
+    return sorted(found.values(), key=lambda r: r["number"])
+
+
 def _toc_page_density(doc, start_0: int) -> int:
     """Count section-number lines across the TOC's first few pages, used to
     sanity-check an outline-derived range against the text-scan candidate."""
@@ -396,7 +450,11 @@ def _running_header_lines(doc, toc_start: int, toc_end: int) -> set[str]:
 
 
 def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
-    found: dict[str, dict] = {}
+    # Keyed by (number, normalized-title) so a number listed twice with DISTINCT
+    # titles is kept as two entries (#45), while running-header echoes / identical
+    # reprints across TOC pages still collapse. Same-number/same-title dups are
+    # collapsed here but still caught via the body occurrences.
+    found: dict[tuple[str, str], dict] = {}
     running_headers = _running_header_lines(doc, toc_start, toc_end)
 
     for page_idx in range(toc_start, toc_end + 1):
@@ -431,7 +489,7 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
             bare = is_bare_section_number(line)
             if bare:
                 norm = normalize_section_num(bare)
-                if norm and is_valid_csi_number(norm) and norm not in found:
+                if norm and is_valid_csi_number(norm):
                     title = ""
                     if i + 1 < len(nonempty):
                         _, next_line = nonempty[i + 1]
@@ -444,8 +502,9 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
                         ):
                             title = re.sub(r"\s*\.{2,}.*$", "", next_line)
                             title = re.sub(r"\s+\d{1,4}\s*$", "", title).strip()
-                    if looks_like_toc_title(title):
-                        found[norm] = {
+                    key = (norm, normalize_title_for_dup(title))
+                    if looks_like_toc_title(title) and key not in found:
+                        found[key] = {
                             "number": norm,
                             "title": title,
                             "toc_page": page_idx + 1,
@@ -457,7 +516,7 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
             if m:
                 raw_num = m.group(1)
                 norm = normalize_section_num(raw_num)
-                if norm and is_valid_csi_number(norm) and norm not in found:
+                if norm and is_valid_csi_number(norm):
                     after = line[m.end() :].strip()
                     before = line[: m.start()].strip()
                     before = re.sub(
@@ -473,19 +532,36 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
                         else before_clean
                     )
                     title = re.sub(r"\s+", " ", title).strip()
-                    if looks_like_toc_title(title):
-                        found[norm] = {
+                    key = (norm, normalize_title_for_dup(title))
+                    if looks_like_toc_title(title) and key not in found:
+                        found[key] = {
                             "number": norm,
                             "title": title,
                             "toc_page": page_idx + 1,
                         }
             i += 1
 
-    return list(found.values())
+    return _assign_occurrences(list(found.values()))
 
 
 BODY_HEADER_MAX_NONEMPTY_INDEX = 30
 _SENTENCE_TITLE_RE = re.compile(r"\.\s+[A-Z][a-z]")
+
+# Running header that reliably encodes the page's true section, e.g.
+# "03 20 00 - 2" (section number followed by a per-section page counter).
+_RUNNING_HEADER_RE = re.compile(
+    r"^(\d{2}[\s.]\d{2}[\s.]\d{2}(?:\.\d+)?)\s*[-–—]\s*(\d+)$"
+)
+# A real CSI body header is written all-caps ("SECTION 03 60 00 - TITLE"),
+# even when the number itself is wrong (a mis-numbered header — left for #44).
+# Inline prose references use title/lower case ("Section 013300 - ...").
+_CAPS_SECTION_HEADER_RE = re.compile(r"^(?:SECTION|DOCUMENT|DIVISION)\s")
+# Inline related-section reference: title-case "Section" + a number.
+_INLINE_REF_HEADER_RE = re.compile(r"^Section\s+\d")
+
+
+def _is_caps_section_header(line: str) -> bool:
+    return bool(_CAPS_SECTION_HEADER_RE.match(line))
 
 
 def _is_sentence_shape_title(title: str) -> bool:
@@ -495,14 +571,63 @@ def _is_sentence_shape_title(title: str) -> bool:
     return bool(_SENTENCE_TITLE_RE.search(title))
 
 
+def _page_running_header_section(nonempty: list[str]) -> Optional[str]:
+    """Normalized section number from the page's running header, or None.
+
+    Real CSI body pages carry a running header like ``03 20 00 - 2`` that
+    encodes the page's actual section; the section's first page reads
+    ``... - 1``. We use it to reject inline ``Section NNNNNN`` prose references
+    that would otherwise be mis-promoted to standalone body sections (#42)."""
+    rh = _page_running_header(nonempty)
+    return rh[0] if rh else None
+
+
+def _page_running_header(nonempty: list[str]) -> Optional[tuple[str, int]]:
+    """(normalized section, per-section page counter) from the running header,
+    or None. Counter == 1 marks a section's first page — used to tell a genuine
+    second section sharing a number (#45) from a continuation page."""
+    for line in nonempty:
+        m = _RUNNING_HEADER_RE.match(line)
+        if m:
+            norm = normalize_section_num(m.group(1))
+            if norm and is_valid_csi_number(norm):
+                return norm, int(m.group(2))
+    return None
+
+
+def normalize_title_for_dup(title: str) -> str:
+    """Aggressive title normalization for duplicate-name detection (#45):
+    lowercase, treat hyphen/space as equivalent, strip punctuation. So
+    'Cold Formed Metal Framing' and 'Cold-Formed Metal Framing' collapse."""
+    t = (title or "").lower()
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _assign_occurrences(sections: list[dict]) -> list[dict]:
+    """Number repeated section numbers 1, 2, ... in list (page) order."""
+    counts: dict[str, int] = {}
+    for sec in sections:
+        counts[sec["number"]] = counts.get(sec["number"], 0) + 1
+        sec["occurrence"] = counts[sec["number"]]
+    return sections
+
+
 def extract_body_sections(doc, body_start: int) -> list[dict]:
-    found: dict[str, dict] = {}
+    # number -> first page seen, so a later page sharing the number is only kept
+    # when the running header marks it as a genuine new section start (#45).
+    first_page: dict[str, int] = {}
+    occurrences: list[dict] = []
     n = len(doc)
 
     for page_idx in range(body_start, n):
         text = doc[page_idx].get_text()
         lines = [line.strip() for line in text.split("\n")]
         nonempty = [line for line in lines if line]
+
+        rh = _page_running_header(nonempty)
+        header_section = rh[0] if rh else None
+        header_counter = rh[1] if rh else None
 
         found_section_this_page = False
         for line_i, line in enumerate(nonempty):
@@ -520,9 +645,45 @@ def extract_body_sections(doc, body_start: int) -> list[dict]:
                 continue
             if norm == "00 00 00":
                 continue
-            if norm in found:
-                found_section_this_page = True
+            # The page's running header encodes its true section. A match whose
+            # number differs AND isn't written as an all-caps "SECTION" header
+            # is an inline related-section reference in body prose (e.g.
+            # "Section 013300 - Submittal Procedures:" cited inside 03 20 00's
+            # SUBMITTALS article), not a header (#42). All-caps headers that
+            # differ are genuine mis-numbered headers, left for #44.
+            if (
+                header_section is not None
+                and norm != header_section
+                and not _is_caps_section_header(line)
+            ):
                 continue
+            # No running header to cross-check against: reject title-case
+            # "Section NNNNNN ..." prose refs (real headers are all-caps).
+            if header_section is None and _INLINE_REF_HEADER_RE.match(line):
+                continue
+            # The number was already recorded. Only keep this as a SECOND
+            # section (#45) when the page is a genuine new section start:
+            # either the running header counter == 1, or (when the page carries
+            # no running header) an all-caps SECTION header sits at the very top.
+            # Continuation pages have counter >= 2 and no top-of-page header, so
+            # they're skipped — as are mid-section self-references.
+            if norm in first_page:
+                on_new_page = page_idx + 1 != first_page[norm]
+                # On a page with no running header, an all-caps SECTION line is
+                # a genuine new start only when a PART/GENERAL indicator follows
+                # shortly after (a mid-prose reference has no such structure).
+                followed_by_part = any(
+                    PART_HEADER_RE.match(nl) or BODY_INDICATOR_RE.search(nl)
+                    for nl in nonempty[line_i + 1 : line_i + 6]
+                )
+                starts_section = header_counter == 1 or (
+                    header_section is None
+                    and _is_caps_section_header(line)
+                    and followed_by_part
+                )
+                if not (on_new_page and starts_section):
+                    found_section_this_page = True
+                    continue
 
             dash_m = re.search(r"[-\u2013\u2014]\s*(.+)$", line.strip())
             if dash_m:
@@ -540,10 +701,11 @@ def extract_body_sections(doc, body_start: int) -> list[dict]:
                     ):
                         title = candidate
 
-            found[norm] = {"number": norm, "title": title, "page": page_idx + 1}
+            occurrences.append({"number": norm, "title": title, "page": page_idx + 1})
+            first_page.setdefault(norm, page_idx + 1)
             found_section_this_page = True
 
-    return list(found.values())
+    return _assign_occurrences(occurrences)
 
 
 def _build_page_label_index(doc) -> list[tuple[int, str]]:
@@ -701,6 +863,7 @@ def analyze_pdf(
     body_start = toc_e + 1
     toc_secs = extract_toc_sections(doc, toc_s, toc_e)
     body_secs = extract_body_sections(doc, body_start)
+    embedded_reports = detect_embedded_reports(doc)
     page_label_index = _build_page_label_index(doc)
     related_refs = extract_all_section_refs(doc, body_start, body_secs, page_label_index)
 
@@ -783,6 +946,7 @@ def analyze_pdf(
         },
         "toc_sections": sorted(toc_secs, key=lambda x: x["number"]),
         "body_sections": sorted(body_secs, key=lambda x: x["number"]),
+        "embedded_reports": embedded_reports,
         "related_refs": related_refs,
         "toc_not_in_body": sorted(toc_not_in_body, key=lambda x: x["number"]),
         "toc_by_consultant": sorted(toc_by_consultant, key=lambda x: x["number"]),
