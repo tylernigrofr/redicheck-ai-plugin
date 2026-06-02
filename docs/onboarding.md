@@ -7,15 +7,20 @@ Install redicheck-ai in Claude Desktop and run your first spec-check.
 | Prerequisite | Install |
 |--------------|---------|
 | **Python 3.11+** | [python.org/downloads](https://www.python.org/downloads/) — check "Add Python to PATH" on Windows |
+| **Git** | `winget install Git.Git` (Windows) — needed by the plugin marketplace to fetch the plugin |
 | **Claude Desktop** | [claude.ai/download](https://claude.ai/download) — sign in |
 
 `gh` is optional for v0.1.0 — the plugin marketplace is public.
 
 Tyler may need to screenshare the Python install once. Everything after is Claude-driven.
 
+## Pick the right tab
+
+Claude Desktop has two tabs in the left sidebar: **Cowork** and **Claude Code**. **Use Claude Code.** Cowork runs in the cloud and cannot reach your local PDFs or Bluebeam Revu, so redicheck-ai will not work there (ADR-0020). If a skill ever tells you to "switch to the Code tab," that's why.
+
 ## Paste this into Claude
 
-After prerequisites are installed, open a **new Claude Desktop conversation** and paste:
+After prerequisites are installed, open a **new Claude Code conversation** (not Cowork) and paste:
 
 ```text
 I just installed the redicheck-ai plugin prerequisites (Python 3.11+, Claude Desktop).

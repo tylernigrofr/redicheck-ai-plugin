@@ -29,8 +29,11 @@ BUNDLED_DRAWING_RE = re.compile(
 
 _DISCIPLINE = (
     r"civil|structural|architectural|mechanical|plumbing|electrical|"
-    r"food\s*service|foodservice|landscape|interior|technology|telecom|"
-    r"fire\s*protection|security|mep|gpc"
+    r"food\s*service|foodservice|landscape|interiors?|technology|telecom|"
+    r"fire\s*protection|security|mep|gpc|"
+    # Specialty-consultant volumes seen on real sets (Atlas Carlsbad). Novel
+    # names beyond this list are caught by the bookmark-content fallback below.
+    r"photovoltaics?|pv|low\s*voltage|t-?24|title\s*24|vapor\s*intrusion|ebm"
 )
 
 # Per-discipline PDFs and combined-discipline bundles (firm-conventions.md).
@@ -88,6 +91,32 @@ def is_spec_pdf(path: Path) -> bool:
     return bool(SPEC_FILENAME_RE.search(path.name))
 
 
+def _bookmarks_look_like_sheets(path: Path) -> bool:
+    """Content fallback: a drawing set carries depth-2 bookmarks shaped like
+    sheet numbers (``<SHEET> - <TITLE>``), per ADR-0014. Adapts to novel
+    discipline-volume filenames (e.g. ``EBM.pdf``, ``Vapor Intrusion.pdf``)
+    that the filename heuristics don't anticipate.
+
+    Conservative by design: requires several depth-2 entries and a clear
+    majority matching the sheet-number pattern, so report/narrative PDFs with
+    a stray sheet-shaped bookmark are not misclassified.
+    """
+    # Local import to avoid importing PyMuPDF at module load for filename-only callers.
+    from qc_core.drawing.parse import BOOKMARK_RE
+
+    try:
+        import fitz
+
+        with fitz.open(path) as doc:
+            depth2 = [title for level, title, _ in doc.get_toc() if level == 2]
+    except Exception:
+        return False
+    if len(depth2) < 3:
+        return False
+    matched = sum(1 for t in depth2 if BOOKMARK_RE.match(t.strip()))
+    return matched / len(depth2) >= 0.6
+
+
 def is_drawing_pdf(path: Path) -> bool:
     if path.suffix.lower() != ".pdf":
         return False
@@ -101,7 +130,7 @@ def is_drawing_pdf(path: Path) -> bool:
         return True
     if NUMBERED_DRAWING_RE.match(path.name):
         return True
-    return False
+    return _bookmarks_look_like_sheets(path)
 
 
 def drawing_set_pattern(path: Path) -> Literal["single_discipline", "bundled_set"]:

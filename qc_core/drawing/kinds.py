@@ -5,4 +5,5 @@ DRAWING_FINDING_KINDS = (
     "sheet_in_set_not_in_index",
     "sheet_number_mismatch",
     "duplicate_sheet_number",
+    "sheet_discipline_reviewer_resolution",
 )

@@ -27,6 +27,16 @@ RediCheck AI plugin — local-first QC for construction documents.
 
 ## Reflex rules (canonical)
 
+### Wrong-surface detection
+
+If the shell is Linux **and** `${CLAUDE_PLUGIN_ROOT}` is a Windows path, the Reviewer is in Cowork instead of the Claude Code tab. The plugin does not work in Cowork (ADR-0020). Redirect them:
+
+> redicheck-ai needs the **Claude Code** tab in Claude Desktop, not **Cowork**. Switch tabs (left sidebar) and try again.
+
+Do not paste Windows commands for them to run manually.
+
+### Report-issue offers
+
 Offer `/report-issue` when:
 
 1. **Skill exception** — any redicheck skill exits non-zero, throws, or produces an import/command-not-found error.

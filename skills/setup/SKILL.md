@@ -7,6 +7,22 @@ description: First-run setup for redicheck-ai — verify Python 3.11+, create th
 
 Bootstrap the redicheck-ai plugin environment. Run once after install, or when a skill fails with a missing command / import error.
 
+## Wrong-surface check (do this first)
+
+Before anything else, check whether the user is in **Cowork** instead of the **Claude Code tab**. Cowork's Linux sandbox cannot reach Windows AppData and the plugin will not work there (ADR-0020).
+
+Signals you're in Cowork:
+
+- Shell platform is Linux (`uname` returns `Linux`) **and** `${CLAUDE_PLUGIN_ROOT}` contains a Windows-style path (`C:/Users/...` or `C:\Users\...`).
+- Tool calls to `python` / PowerShell error with "command not found" or sandbox restrictions.
+- This session's startup banner did **not** include `redicheck-ai: updating environment`.
+
+If any of those are true, stop and tell the Reviewer verbatim:
+
+> redicheck-ai needs the **Claude Code** tab in Claude Desktop, not **Cowork**. Switch to the Code tab (left sidebar, below Cowork) and re-run `/setup` there. The Cowork sandbox can't reach the local files and Bluebeam Revu that this plugin needs. See ADR-0020 for why.
+
+Do **not** attempt to paste Windows commands for the Reviewer to run manually — that path has confused Reviewers in practice. Just redirect them to the right tab.
+
 ## Prerequisites (host machine)
 
 See `docs/onboarding.md`:

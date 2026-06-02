@@ -70,6 +70,12 @@ PROJECTS = [
         "env_var": "REDICHECK_EMBASSY_SUITES_CLEARWATER_PATH",
         "drawing_glob": "[0-9][0-9]-*.pdf",
     },
+    {
+        "slug": "lakeshore-center",
+        "local_attr": "LAKESHORE_CENTER_PATH",
+        "env_var": "REDICHECK_LAKESHORE_CENTER_PATH",
+        "drawing_glob": "Drawings.pdf",
+    },
 ]
 
 

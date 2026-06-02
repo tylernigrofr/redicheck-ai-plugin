@@ -19,7 +19,7 @@ qc-index <project-folder> --force
 - Discovers spec PDFs via filename heuristics (`Specs.pdf`, `Specifications.pdf`, etc.)
 - Discovers drawing PDFs (bundled `Drawings.pdf`, per-discipline PDFs, numbered volumes)
 - Runs `qc_core.spec.indexer` and `qc_core.drawing.indexer` (ADR-0014)
-- Writes spec tables, `drawing_volumes`, `drawing_sheets`, `drawing_index_entries`, and findings
+- Writes spec tables, `drawing_volumes`, `drawing_sheets` (per-sheet inferred `discipline`), `drawing_index_entries`, and findings
 - Skips re-index when PDF mtime unchanged (ADR-0010)
 
 ## Related ADRs

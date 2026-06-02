@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qc-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "RediCheck qc-core: local-first spec and drawing index substrate"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ qc-index = "qc_core.cli:qc_index_main"
 spec-check = "qc_core.cli:spec_check_main"
 spec-check-mcp = "qc_core.cli:spec_check_main"  # deprecated alias; emit is PyMuPDF (ADR-0012), not MCP
 drawing-index-qc = "qc_core.cli:drawing_index_main"
+door-check = "qc_core.cli:door_check_main"
 report-issue = "qc_core.feedback_report:main"
 
 [tool.setuptools.packages.find]

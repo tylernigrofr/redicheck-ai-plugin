@@ -13,6 +13,10 @@ from qc_core.drawing.kinds import DRAWING_FINDING_KINDS
 from qc_core.drawing import emit as drawing_emit
 from qc_core.drawing import indexer as drawing_indexer
 from qc_core.drawing import queries as drawing_queries
+from qc_core.door import emit as door_emit_mod
+from qc_core.door import indexer as door_indexer
+from qc_core.door import queries as door_queries
+from qc_core.door.kinds import DOOR_FINDING_KINDS
 from qc_core.spec import emit as emit_mod
 from qc_core.spec import indexer, queries
 from qc_core.spec.kinds import SPEC_FINDING_KINDS
@@ -53,7 +57,7 @@ def _run_qc_index(project_folder: str | Path, *, force: bool = False) -> int:
             f"  spec indexed volume {s['volume_id']}: "
             f"TOC {m['toc_section_count']} sections, "
             f"body {m['body_section_count']} sections, "
-            f"{s['related_refs']} cross-refs"
+            f"{s.get('related_refs_count', 0)} cross-refs"
         )
     for s in [x for x in spec_summaries if not x.get("indexed")]:
         print(f"  spec skipped volume {s.get('volume_id')}: {s.get('reason')}")
@@ -73,6 +77,158 @@ def _run_qc_index(project_folder: str | Path, *, force: bool = False) -> int:
             )
     for s in [x for x in drawing_summaries if not x.get("indexed")]:
         print(f"  drawing skipped volume {s.get('volume_id')}: {s.get('reason')}")
+
+    return 0
+
+
+def _format_door_finding(row: dict) -> str:
+    kind = row["kind"]
+    sev = row.get("severity") or "medium"
+    sheet = row.get("sheet_number") or ""
+    if kind == "door_duplicate_number":
+        page = row.get("source_page")
+        door = row.get("title") or ""
+        suffix = f" p.{page}" if page is not None else ""
+        notes = row.get("notes") or ""
+        base = f"  [{sev}] {sheet}{suffix} door={door}".rstrip()
+        return (f"{base} — {notes}").strip() if notes else base
+
+    notes = row.get("notes") or ""
+    subtitle = row.get("title") or ""
+    extras = f" ({subtitle})" if subtitle else ""
+    return (f"  [{sev}] {sheet}{extras} — {notes}" if notes else f"  [{sev}] {sheet}{extras}").strip()
+
+
+def _door_check_preview(conn, project_folder: str | Path) -> None:
+    findings = door_queries.door_findings(conn)
+
+    by_kind: dict[str, list[dict]] = defaultdict(list)
+    for row in findings:
+        by_kind[row["kind"]].append(row)
+
+    print(f"=== door-check preview ({Path(project_folder).name}) ===")
+    print(f"Total findings: {len(findings)}\n")
+
+    for kind in DOOR_FINDING_KINDS:
+        rows = by_kind.get(kind, [])
+        if not rows:
+            continue
+        emit_count = sum(
+            1 for r in rows if r.get("expected_action") == "emit_markup"
+        )
+        print(f"## {kind} ({len(rows)} rows, {emit_count} emit_markup)")
+        for row in rows[:50]:
+            print(_format_door_finding(row))
+        if len(rows) > 50:
+            print(f"  ... and {len(rows) - 50} more")
+        print()
+
+
+def _door_emit(conn, args) -> int:
+    rows = conn.execute(
+        "SELECT id, pdf_path FROM drawing_volumes ORDER BY id"
+    ).fetchall()
+
+    total_emitted = 0
+    total_unmatched = 0
+    for row in rows:
+        manifest = door_emit_mod.build_manifest(conn, row["id"])
+        if not manifest:
+            continue
+        pdf_path = Path(row["pdf_path"])
+        result = door_emit_mod.emit_to_pdf(
+            pdf_path,
+            manifest,
+            in_place=args.in_place,
+        )
+        total_emitted += result.emitted
+        total_unmatched += len(result.unmatched)
+        print(
+            f"volume {row['id']}: {result.emitted} emitted, "
+            f"{len(result.unmatched)} unmatched -> {result.output_path}"
+        )
+        for entry in result.unmatched:
+            print(f"  unmatched: {entry['subject']} p.{entry['page']} bbox")
+
+    print(f"TOTAL: {total_emitted} emitted, {total_unmatched} unmatched")
+    return 0 if total_unmatched == 0 else 1
+
+
+def door_check_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Door schedule discovery, resolution checkpoint, and extraction."
+    )
+    parser.add_argument("project_folder", help="Folder containing drawing PDF(s)")
+    parser.add_argument(
+        "--mode",
+        choices=["preview", "emit"],
+        default="preview",
+        help="preview: grouped door findings; emit: AVW cloudy markups via PyMuPDF (ADR-0012)",
+    )
+    parser.add_argument(
+        "--accept-resolution",
+        action="store_true",
+        help="Accept auto-discovery diff and update stored regions (ADR-0024)",
+    )
+    parser.add_argument(
+        "--map-column",
+        nargs=2,
+        metavar=("RAW", "CANONICAL"),
+        action="append",
+        default=[],
+        help="Persist a column mapping (e.g. 'TO: ROOM' door_no)",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Overwrite the source PDF instead of writing <name>.marked.pdf (emit mode)",
+    )
+    args = parser.parse_args(argv)
+
+    from qc_core.db import init_db
+    from qc_core.discovery import qc_sqlite_path
+    from qc_core.door.column_mapper import save_column_mapping
+
+    if _needs_full_index(args.project_folder):
+        print("qc.sqlite missing or stale — running qc-index...")
+        _run_qc_index(args.project_folder)
+
+    db_path = qc_sqlite_path(args.project_folder)
+    if args.map_column:
+        conn = init_db(db_path)
+        try:
+            for raw, canonical in args.map_column:
+                save_column_mapping(conn, raw, canonical)
+                print(f"  mapped {raw!r} -> {canonical!r}")
+            conn.commit()
+        finally:
+            conn.close()
+
+    result = door_indexer.index_project_doors(
+        args.project_folder,
+        auto_accept_resolution=args.accept_resolution,
+    )
+    print(
+        f"door-check: discovered {result.discovered_regions} regions, "
+        f"resolved {result.resolved_regions}, extracted {result.doors_extracted} doors"
+    )
+    if result.non_door_excluded:
+        print(f"  excluded {result.non_door_excluded} non-door rows")
+    if result.needs_resolution:
+        diff = result.resolution_diff
+        print(
+            f"  RESOLUTION CHECKPOINT: +{len(diff.added)} / -{len(diff.removed)} regions "
+            f"(re-run with --accept-resolution to persist)"
+        )
+        return 1
+
+    conn = door_queries.open_project_db(args.project_folder)
+    try:
+        if args.mode == "emit":
+            return _door_emit(conn, args)
+        _door_check_preview(conn, args.project_folder)
+    finally:
+        conn.close()
 
     return 0
 

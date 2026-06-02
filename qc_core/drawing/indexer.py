@@ -9,6 +9,7 @@ from pathlib import Path
 from qc_core.db import init_db
 from qc_core.drawing.kinds import DRAWING_FINDING_KINDS
 from qc_core.drawing.config import load_drawing_config
+from qc_core.drawing.discipline import infer_sheet_discipline
 from qc_core.drawing.parse import _prefixes, analyze_pdf, normalize_sheet_number
 
 
@@ -105,11 +106,16 @@ def index_drawing_pdf(
         volume_id = cur.lastrowid
 
     for sheet in result["sheets"]:
+        inf = infer_sheet_discipline(
+            sheet["sheet_number"],
+            sheet.get("title"),
+            volume_discipline_hint=discipline,
+        )
         conn.execute(
             """
             INSERT INTO drawing_sheets (
-                volume_id, sheet_number, title, page, confidence
-            ) VALUES (?, ?, ?, ?, ?)
+                volume_id, sheet_number, title, page, confidence, discipline
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 volume_id,
@@ -117,6 +123,7 @@ def index_drawing_pdf(
                 sheet.get("title"),
                 sheet["page"],
                 sheet.get("confidence"),
+                inf.discipline,
             ),
         )
 
@@ -165,17 +172,19 @@ def _insert_finding(
     title: str | None = None,
     source_page: int | None = None,
     notes: str | None = None,
+    expected_action: str = "emit_markup",
 ) -> None:
     conn.execute(
         """
         INSERT INTO findings (
             drawing_volume_id, kind, expected_action, severity,
             sheet_number, title, source_page, notes
-        ) VALUES (?, ?, 'emit_markup', ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             drawing_volume_id,
             kind,
+            expected_action,
             _severity_for_kind(kind),
             sheet_number,
             title,
@@ -190,7 +199,36 @@ def _severity_for_kind(kind: str) -> str:
         return "high"
     if kind == "sheet_number_mismatch":
         return "medium"
+    if kind == "sheet_discipline_reviewer_resolution":
+        return "low"
     return "medium"
+
+
+def _emit_sheet_discipline_review_findings(conn: sqlite3.Connection) -> None:
+    """ADR-0023: surfaced checkpoints when inference is ambiguous."""
+    rows = conn.execute(
+        """
+        SELECT ds.volume_id, ds.sheet_number, ds.title, dv.discipline AS vol_disc
+        FROM drawing_sheets ds
+        JOIN drawing_volumes dv ON dv.id = ds.volume_id
+        """
+    ).fetchall()
+    for row in rows:
+        meta = infer_sheet_discipline(
+            row["sheet_number"],
+            row["title"],
+            volume_discipline_hint=row["vol_disc"],
+        )
+        if meta.needs_resolution:
+            _insert_finding(
+                conn,
+                kind="sheet_discipline_reviewer_resolution",
+                sheet_number=row["sheet_number"],
+                drawing_volume_id=row["volume_id"],
+                title=row["title"],
+                notes=meta.rationale,
+                expected_action="info_only",
+            )
 
 
 def compute_drawing_findings(conn: sqlite3.Connection) -> None:
@@ -240,6 +278,14 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
     for (vol_id, source), entries in entries_by_volume_source.items():
         if source == "master_index":
             master_entries.extend(entries)
+    # Project-wide master coverage, available to the per-volume reconciliation
+    # below: a sheet listed in the master index is accounted for even if its own
+    # discipline sub-index omitted it (e.g. a parse gap on the volume's index
+    # page). Without this, such a sheet falsely flags sheet_in_set_not_in_index
+    # at the per-volume level despite being present in drawing_index_entries (#39).
+    master_keys_all = {
+        normalize_sheet_number(e["sheet_number"]) for e in master_entries
+    }
 
     def _flag_duplicates(entries: list[dict], vol_id: int, source_label: str) -> None:
         counts: dict[str, int] = {}
@@ -323,7 +369,9 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
                     notes="volume_index",
                 )
         for key, row in vol_sheets.items():
-            if not _index_covers(key, index_keys):
+            if not _index_covers(key, index_keys) and not _index_covers(
+                key, master_keys_all
+            ):
                 _insert_finding(
                     conn,
                     kind="sheet_in_set_not_in_index",
@@ -362,12 +410,16 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
                 for e in entries
                 if normalize_sheet_number(e["sheet_number"]) in project_set_keys
             }
+            # Scope by EXACT sheet prefix, not startswith: distinct disciplines
+            # can share a leading letter (Atlas Electrical `E`, Energy `EN`,
+            # Building-envelope `EBM`), and a startswith test pulled EN*/EBM*
+            # master entries into the Electrical volume's cross-check, flagging
+            # them all as master_vs_volume_index disagreements (#39).
             master_in_scope = {
                 key: entry
                 for key, entry in master_by_key.items()
-                if any(
-                    entry["sheet_number"].upper().startswith(p) for p in vol_prefixes
-                )
+                if (mm := _SHEET_PREFIX_RE.match(entry["sheet_number"]))
+                and mm.group(1).upper() in vol_prefixes
             }
             master_scope_keys = set(master_in_scope.keys())
             for key in volume_index_keys:
@@ -419,6 +471,8 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
                     source_page=mm.get("page"),
                     notes="titleblock_crosscheck",
                 )
+
+    _emit_sheet_discipline_review_findings(conn)
 
 
 def index_project(

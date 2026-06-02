@@ -85,23 +85,78 @@ def extract_bookmarks(doc: fitz.Document) -> tuple[list[dict], float]:
     return parsed, rate
 
 
+_LETTERSPACE_RE = re.compile(r"(?<=\b[A-Za-z]) (?=[A-Za-z]\b)")
+
+
+def _collapse_letterspacing(text: str) -> str:
+    """Collapse single spaces between single letters so header detection survives
+    letter-spaced title typography (e.g. ``S H E E T  I N D E X`` → ``SHEET  INDEX``).
+
+    Only intra-word single-glyph spacing is removed; the double space between
+    words is left intact, so ``SHEET\\s+INDEX``-style patterns still match.
+    """
+    prev = None
+    out = text
+    # Apply repeatedly: collapsing one gap can expose the next (S·H·E·E·T).
+    while out != prev:
+        prev = out
+        out = _LETTERSPACE_RE.sub("", out)
+    return out
+
+
 def find_index_page(doc: fitz.Document, *, max_pages: int = 15) -> Optional[int]:
     """1-based page number with index header, or None (method B)."""
     for i in range(min(max_pages, doc.page_count)):
         txt = doc[i].get_text("text") or ""
-        if INDEX_PAGE_RE.search(txt):
+        if INDEX_PAGE_RE.search(txt) or INDEX_PAGE_RE.search(_collapse_letterspacing(txt)):
             return i + 1
     return None
 
 
-_LINE_SHEET_RE = re.compile(
-    # Sheet number = prefix letters, optional hyphen, digits, then either:
-    #   - up to 4 trailing letters (e.g. A101A), or
-    #   - .<suffix> where suffix is digit-led (e.g. .06A, .2A, .4) or 1-2 letters (e.g. .A, .EC).
-    # The two branches are mutually exclusive so trailing letters can't absorb
-    # extras after a dot-suffix (which would let things like FR5210.ECD parse).
-    r"^[A-Z]{1,4}-?\d{1,4}(?:[A-Za-z]{0,4}|\.(?:\d[A-Za-z0-9]{0,3}|[A-Za-z]{1,2}))$"
+# Sheet-number grammar, shared by the bare (own-line) and inline (number + title
+# on one line) matchers. Two top-level forms:
+#   1. prefix + digits, then either up to 4 trailing letters (A101A) OR a
+#      dot-suffix that is digit-led (.06A, .2A, .4) or 1-2 letters (.A, .EC),
+#      optionally followed by a second dot-segment for three-part numbers.
+#      The second segment may be digits (Q0.2.1 campus-fiber sub-sheets) OR
+#      1-2 letters (SA1.12.S / SA1.11.F structural slab variants — Atlas, #39).
+#   2. prefix + dot + digits[+letters] with NO digit before the dot
+#      (ID.000, ID.400A, G.10, EN.1, GRN.1, T.01, ABS.11 — the specialty
+#      discipline sections of Atlas's master index, #39).
+# Trailing letters and dot-suffixes stay mutually exclusive so a code like
+# FR5210.ECD still can't parse (see #23): form 1 rejects the 3-letter suffix,
+# and form 2 requires the prefix to butt straight against the dot.
+_SHEET_CORE = (
+    r"(?:"
+    r"[A-Z]{1,4}-?\d{1,4}(?:[A-Za-z]{0,4}|\.(?:\d[A-Za-z0-9]{0,3}|[A-Za-z]{1,2})(?:\.(?:\d{1,3}|[A-Za-z]{1,2}))?)"
+    r"|[A-Z]{1,4}\.\d{1,4}[A-Za-z]{0,3}"
+    r")"
 )
+_LINE_SHEET_RE = re.compile(r"^" + _SHEET_CORE + r"$")
+# Inline row: ``SA1.12.1 BLDG A -2ND STORY SLAB PLAN`` — sheet number and title
+# share one line (some firms lay out the master index this way). The title must
+# carry at least one letter so date / issuance fragments don't qualify.
+#
+# Inline matching is restricted (see _inline_row): a token qualifies only if it
+# has a multi-letter discipline prefix (EBM2.1, SA1.12.1) OR carries two dots
+# (SA1.12.S). Single-letter-prefix shallow tokens are left to the bare own-line
+# path only — schedules and legends list short codes like ``A1 STANDARD KING
+# STUDIO`` / ``A2.1 …`` (Embassy unit types) inline, and admitting those would
+# flood `sheet_in_index_not_in_set`. Real inline sheet rows never look that thin.
+_INLINE_SHEET_RE = re.compile(r"^(" + _SHEET_CORE + r")\s+(.*[A-Za-z].*)$")
+
+
+def _inline_row(line: str):
+    """Return (token, title) for a qualifying inline sheet row, else None."""
+    m = _INLINE_SHEET_RE.match(line)
+    if not m:
+        return None
+    token = m.group(1).upper()
+    pm = _SHEET_PREFIX_RE.match(token)
+    prefix = pm.group(1) if pm else ""
+    if len(prefix) < 2 and token.count(".") < 2:
+        return None
+    return token, m.group(2).strip()
 
 
 def _parse_index_lines(lines: list[str]) -> list[dict]:
@@ -121,6 +176,21 @@ def _parse_index_lines(lines: list[str]) -> list[dict]:
     while i < len(lines):
         ln = lines[i]
         if not _LINE_SHEET_RE.match(ln):
+            # Inline layout: number and title on the same line. Only consult this
+            # after the bare match fails (the two are mutually exclusive — the
+            # bare regex is anchored, so a line with a trailing title never
+            # matches it).
+            inline = _inline_row(ln)
+            if inline:
+                token, title = inline
+                if (
+                    _is_plausible_sheet_token(token)
+                    and not re.match(r"^\d{1,4}[\-/\.]\d", title)
+                    and not re.match(r"^DENOTES\b", title, re.IGNORECASE)
+                    and token not in seen
+                ):
+                    seen.add(token)
+                    entries.append({"sheet_number": token, "title": title})
             i += 1
             continue
         token = ln.upper()
@@ -132,7 +202,7 @@ def _parse_index_lines(lines: list[str]) -> list[dict]:
         j = i + 1
         while j < len(lines) and j < i + 3:
             nxt = lines[j]
-            if _LINE_SHEET_RE.match(nxt):
+            if _LINE_SHEET_RE.match(nxt) or _inline_row(nxt):
                 break
             # Skip date / issuance rows but keep titles that start with a digit
             # (e.g. "1ST FLOOR PLAN", "2ND FLOOR DEMO", "3 BEDROOM UNIT").
@@ -169,13 +239,27 @@ def _parse_index_lines(lines: list[str]) -> list[dict]:
 
 
 def _find_continuation_pages(
-    doc: fitz.Document, start_page: int, *, max_extra: int = 10
+    doc: fitz.Document,
+    start_page: int,
+    *,
+    max_extra: int = 10,
+    project_bookmark_prefixes: set[str] | None = None,
 ) -> list[int]:
     """1-based pages, starting from `start_page`, that look like index continuations.
 
     Continuation = page yields >= 5 paired entries via `_parse_index_lines`. Stops
     at the first page that fails the threshold. Returns at least `[start_page]`
     even if it parses poorly, so analyse_pdf can attribute the source.
+
+    When project-wide bookmark prefixes are supplied, the >= 5 threshold counts
+    only entries whose prefix corresponds to a real sheet somewhere in the
+    project (#23). A genuine index continuation lists real project sheet numbers;
+    the schedule/finish sheets that *follow* an index page (QO Interior Design
+    pages 3-10: hardware/finish/material schedules) carry one cover-sheet number
+    each in their title block plus a flood of schedule codes (HD-/FT-/DF-/PF-/...)
+    that look sheet-shaped but match no project prefix. Filtering by project
+    prefix collapses each such page to ~1 qualifying entry, so the walk stops at
+    the real index page instead of scraping the schedule bodies.
     """
     pages = [start_page]
     for i in range(start_page, min(start_page + max_extra, doc.page_count)):
@@ -190,6 +274,12 @@ def _find_continuation_pages(
             r for r in rows
             if r.get("title") and len(r["title"]) >= 10 and not r["title"].strip("_").strip() == ""
         ]
+        if project_bookmark_prefixes is not None:
+            substantive = [
+                r for r in substantive
+                if (m := _SHEET_PREFIX_RE.match(r["sheet_number"]))
+                and m.group(1).upper() in project_bookmark_prefixes
+            ]
         if len(substantive) >= 5:
             pages.append(i + 1)
         else:
@@ -330,7 +420,9 @@ def analyze_pdf(
         if index_page is not None:
             # Walk forward across continuation pages (some firms split the index across
             # multiple consecutive pages without repeating the INDEX header).
-            index_pages = _find_continuation_pages(doc, index_page)
+            index_pages = _find_continuation_pages(
+                doc, index_page, project_bookmark_prefixes=project_bookmark_prefixes
+            )
             raw_rows_all: list[dict] = []
             seen_keys: set[str] = set()
             page_of: dict[str, int] = {}
