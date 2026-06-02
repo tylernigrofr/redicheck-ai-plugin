@@ -16,7 +16,12 @@ in the Drawing Set.
 qc-index <project-folder>
 drawing-index-qc <project-folder> --mode=preview
 drawing-index-qc <project-folder> --mode=emit --reviewer "Your Name"
+drawing-index-qc <project-folder> --mode=emit --kind sheet_in_index_not_in_set
 ```
+
+Reviewer resolution: `--reviewer` > `qc.config.toml [reviewer] name` > built-in
+default `REDICHECK-TKN`. `--kind` (repeatable) restricts emit to the given
+finding kind(s); omit it to emit every markup-eligible kind.
 
 Default `--mode=preview`. The flip to `emit` is deferred — see [precision-thresholds.md](../../docs/precision-thresholds.md) (Default-flip status, drawing-index-qc) for the 2026-05-21 baseline and the conditions for revisit.
 
@@ -24,14 +29,15 @@ Default `--mode=preview`. The flip to `emit` is deferred — see [precision-thre
 
 - Auto-runs `qc-index` when `qc.sqlite` is missing or stale (spec or drawing PDFs).
 - **preview**: prints drawing findings grouped by `kind` from `qc.sqlite`.
-- **emit**: writes Squiggly (+ Stamp for UNLISTED) annotations via PyMuPDF (ADR-0012). Requires `--reviewer` or `[reviewer] name` in `qc.config.toml`. Default output is `<name>.marked.pdf`; pass `--in-place` to overwrite sources.
+- **emit**: writes one red Revu-style FreeText callout per finding via PyMuPDF (ADR-0012) — the same markup style as spec-check (`qc_core.markup`). Reviewer falls back to `qc.config.toml [reviewer] name`, else the built-in default `REDICHECK-TKN`. Default output is `<name>.marked.pdf`; pass `--in-place` to overwrite sources.
 
 ## Emit conventions (ADR-0012)
 
+- **Markup** = red, bold FreeText callout, Bluebeam-Revu-native rich text, placed next to the sheet number on the page.
 - **Author** = configured Reviewer (`/T`), not Assistant.
 - **Subject** = `drawing-index-qc:<kind>` (kebab-case kind slug).
 - **Comments** = one-line explanation; sheet number; source page.
-- **Idempotency**: re-run skips annotations with matching Subject + Comments + page.
+- **Idempotency**: re-run deletes prior `drawing-index-qc:` markups and rewrites them — no duplication.
 
 ## Extraction (ADR-0014)
 

@@ -1,6 +1,6 @@
 ---
 name: door-check
-description: Door schedule duplicate detection and optional PyMuPDF markup emit. Preview surfaces kind-scoped counts; emit draws blue cloudy AVW rectangles on schedule row bboxes for duplicate door numbers within the same schedule table.
+description: Door schedule duplicate detection and optional PyMuPDF markup emit. Preview surfaces kind-scoped counts; emit draws red Revu-style FreeText callouts at schedule row bboxes for duplicate door numbers within the same schedule table.
 ---
 
 # /door-check
@@ -11,6 +11,7 @@ Run door indexing and duplicate detection against `qc.sqlite` (issue #34).
 
 ```bash
 door-check <project-folder> --mode=preview
+door-check <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
 door-check <project-folder> --mode=emit --in-place
 ```
 
@@ -22,11 +23,13 @@ door-check <project-folder> --mode=emit --in-place
   `findings` after each door index run.
 - **preview** (`--mode=preview`, default): prints findings grouped by `kind`, with
   `emit_markup` counts per section (mirrors `/spec-check`).
-- **emit** (`--mode=emit`): writes cloudy blue rectangle markups on the duplicate
-  row bbox via PyMuPDF. Re-running deletes prior `door-check:` annotations first
-  — no duplication. Default output is `<source>.marked.pdf` next to the drawing PDF.
-- **Author**: `RediCheck Assistant` (Candidate convention, ADR-0009). Subject
-  `door-check:door-duplicate-number`; Comments carry the AVW explanation.
+- **emit** (`--mode=emit`): writes one red Revu-style FreeText callout per duplicate,
+  placed next to the row bbox via PyMuPDF — the same markup style as spec-check
+  (`qc_core.markup`). Re-running deletes prior `door-check:` annotations first — no
+  duplication. Default output is `<source>.marked.pdf` next to the drawing PDF.
+- **Author**: configured Reviewer (`--reviewer` flag, `qc.config.toml [reviewer] name`,
+  else default `REDICHECK-TKN`). Subject `door-check:door-duplicate-number`; Comments
+  carry the AVW explanation.
 
 ## Related
 

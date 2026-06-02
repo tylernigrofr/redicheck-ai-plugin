@@ -12,9 +12,18 @@ Run spec-check against indexed data in `qc.sqlite`.
 ```bash
 spec-check <project-folder> --mode=preview
 spec-check <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
-spec-check <project-folder> --mode=emit                      # uses qc.config.toml
+spec-check <project-folder> --mode=emit                      # uses qc.config.toml, else default reviewer
+spec-check <project-folder> --mode=emit --kind broken_related_ref   # only this kind
+spec-check <project-folder> --mode=emit --kind broken_related_ref --kind toc_not_in_body
 spec-check <project-folder> --mode=emit --in-place
 ```
+
+Reviewer resolution: `--reviewer` > `qc.config.toml [reviewer] name` >
+built-in default `REDICHECK-TKN`. Emit no longer errors when none is set.
+
+`--kind` (repeatable) restricts emit to the given finding kind(s); omit it to
+emit every markup-eligible kind. Valid kinds match the preview group headers
+(e.g. `broken_related_ref`, `toc_not_in_body`, `duplicate_section_number`).
 
 The legacy `spec-check-mcp` script name remains as a deprecated alias for
 backwards compatibility; new callers should use `spec-check`. Despite the
@@ -54,14 +63,18 @@ finishes in well under 5 seconds.
 
 ## Markup types by kind
 
-| Kind | Type | Anchors on |
-|---|---|---|
-| `broken_related_ref` | Squiggly | Bad reference text |
-| `body_not_in_toc` | Squiggly | Alphabetically-adjacent TOC section (ADR-0011) |
-| `section_number_mismatch` | Squiggly | Mis-numbered body header (title matches TOC, number differs — #44) |
-| `division_referenced_but_not_included` | Highlight | `TABLE OF CONTENTS` header |
-| `title_mismatch_across_volumes` | — | `info_only`; preview only, no markup emitted |
-| `embedded_report_present` | — | `info_only`; preview only — bound-in non-CSI report (#43), not a defect |
+Every emitted markup is a red, bold, Bluebeam-Revu-native FreeText callout
+(styling lives in `qc_core.markup`, shared with drawing-index-qc and door-check).
+The kind only determines where the callout anchors:
+
+| Kind | Anchors on |
+|---|---|
+| `broken_related_ref` | Bad reference text |
+| `body_not_in_toc` | Alphabetically-adjacent TOC section (ADR-0011) |
+| `section_number_mismatch` | Mis-numbered body header (title matches TOC, number differs — #44) |
+| `division_referenced_but_not_included` | `TABLE OF CONTENTS` header |
+| `title_mismatch_across_volumes` | `info_only`; preview only, no markup emitted |
+| `embedded_report_present` | `info_only`; preview only — bound-in non-CSI report (#43), not a defect |
 
 All markups carry `Author = <reviewer>`, `Subject = "spec-check:<kind>"`, and a
 populated `Comments` field — the structure Reviewer triage relies on.

@@ -1,18 +1,20 @@
-"""Door-check PDF annotation emit (ADR-0012 PyMuPDF)."""
+"""Door-check PDF annotation emit (ADR-0012 PyMuPDF).
+
+Emits the same red Revu-style FreeText callout as spec-check, anchored at the
+duplicate door-schedule row bbox. Styling and placement live in `qc_core.markup`.
+"""
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
+
+from qc_core import markup
+from qc_core.markup import EmitResult
 
 SUBJECT_PREFIX = "door-check"
 _SUBJECT = f"{SUBJECT_PREFIX}:door-duplicate-number"
-
-DOOR_CHECK_AUTHOR = "RediCheck Assistant"
-_BLUE_STROKE = (0.0, 0.498039, 1.0)
 
 _SUBJECT_BY_KIND = {
     "door_duplicate_number": _SUBJECT,
@@ -70,54 +72,31 @@ def build_manifest(conn: sqlite3.Connection, volume_id: int) -> list[dict]:
     return manifest
 
 
-@dataclass
-class EmitResult:
-    emitted: int = 0
-    unmatched: list[dict] = field(default_factory=list)
-    output_path: Path | None = None
-
-
-def _pdf_date(dt: datetime) -> str:
-    return "D:" + dt.strftime("%Y%m%d%H%M%S") + "Z"
-
-
-def _delete_door_check_annots(doc) -> None:
-    import fitz
-
-    for page in doc:
-        to_delete: list[object] = []
-        for annot in page.annots() or []:
-            info = annot.info or {}
-            subj = info.get("subject") or ""
-            if subj.startswith(f"{SUBJECT_PREFIX}:"):
-                to_delete.append(annot)
-        for ann in to_delete:
-            page.delete_annot(ann)
-
-
 def emit_to_pdf(
     pdf_path: Path | str,
     manifest: list[dict],
+    reviewer: str,
     output_path: Path | str | None = None,
     in_place: bool = False,
 ) -> EmitResult:
-    """Emit cloudy blue rectangles at row bboxes per ADR markup convention."""
+    """Write manifest entries as red Revu-style FreeText callouts (ADR-0012).
+
+    Each entry becomes a borderless red-text FreeText box placed next to the
+    duplicate door row's bbox. Existing `door-check:`-subject annotations are
+    deleted first so re-running produces no duplicates. Styling and placement
+    live in `qc_core.markup`.
+    """
     import fitz
 
     src = Path(pdf_path)
-    if not in_place and output_path is None:
-        out = src.with_name(f"{src.stem}.marked.pdf")
-    elif in_place:
-        out = src
-    else:
-        out = Path(output_path)
-
-    now_pdf = _pdf_date(datetime.now(timezone.utc))
+    out = markup.resolve_output_path(src, output_path, in_place)
+    now_pdf = markup.pdf_date()
     result = EmitResult(output_path=out)
+    placed_by_page: dict[int, list] = {}
 
     doc = fitz.open(src)
     try:
-        _delete_door_check_annots(doc)
+        markup.delete_markups(doc, SUBJECT_PREFIX)
 
         for entry in manifest:
             page_num = int(entry["page"])
@@ -130,30 +109,21 @@ def emit_to_pdf(
                 result.unmatched.append(entry)
                 continue
 
-            rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
             page = doc[pidx]
-            annot = page.add_rect_annot(rect)
-            annot.set_border(width=1.25, clouds=1)
-            annot.set_colors(stroke=_BLUE_STROKE)
-            annot.set_opacity(0.45)
-            annot.set_info(
-                title=DOOR_CHECK_AUTHOR,
+            anchor = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+            markup.add_freetext_markup(
+                doc,
+                page,
+                anchor,
+                comment=entry.get("comment", ""),
+                reviewer=reviewer,
                 subject=entry["subject"],
-                content=entry.get("comment", ""),
-                creationDate=now_pdf,
-                modDate=now_pdf,
+                now_pdf=now_pdf,
+                placed_by_page=placed_by_page,
             )
-            annot.update()
             result.emitted += 1
 
-        if in_place:
-            tmp = src.with_suffix(src.suffix + ".tmp")
-            doc.save(tmp, deflate=True)
-            doc.close()
-            tmp.replace(src)
-        else:
-            doc.save(out, deflate=True)
-            doc.close()
+        markup.save_doc(doc, src, out, in_place)
     finally:
         if not doc.is_closed:
             doc.close()

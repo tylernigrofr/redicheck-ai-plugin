@@ -7,13 +7,13 @@ directly via PyMuPDF (ADR-0012, supersedes the MCP emit path for mass-emit).
 
 from __future__ import annotations
 
-import html
 import re
 import sqlite3
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from qc_core import markup
+from qc_core.markup import EmitResult
 
 SUBJECT_PREFIX = "spec-check"
 
@@ -170,23 +170,30 @@ def build_manifest(
     conn: sqlite3.Connection,
     volume_id: int,
     section_format: str = "XX XX XX",
+    kinds: Iterable[str] | None = None,
 ) -> list[dict]:
     """Return one manifest entry per emit_markup finding for the given volume.
 
     `section_format` controls how section numbers appear in comment text. Use
     `detect_section_format()` against the source PDF to match the project's
     on-page style. Search terms still cover all variants for matching robustness.
+
+    `kinds`, when given, restricts the manifest to those finding kinds.
     """
     fmt = section_format
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT * FROM findings
-        WHERE volume_id = ? AND expected_action = 'emit_markup'
-        ORDER BY kind, section, from_section, to_section, source_page
-        """,
-        (volume_id,),
-    ).fetchall()
+    kind_list = list(kinds) if kinds is not None else None
+    query = (
+        "SELECT * FROM findings "
+        "WHERE volume_id = ? AND expected_action = 'emit_markup'"
+    )
+    params: list = [volume_id]
+    if kind_list:
+        placeholders = ", ".join("?" for _ in kind_list)
+        query += f" AND kind IN ({placeholders})"
+        params.extend(kind_list)
+    query += " ORDER BY kind, section, from_section, to_section, source_page"
+    rows = conn.execute(query, params).fetchall()
 
     toc_nums = _toc_numbers(conn, volume_id)
     toc_divisions = {n.split()[0] for n in toc_nums if n.split()}
@@ -327,129 +334,6 @@ def build_manifest(
     return entries
 
 
-@dataclass
-class EmitResult:
-    emitted: int = 0
-    skipped_existing: int = 0
-    unmatched: list[dict] = field(default_factory=list)
-    output_path: Path | None = None
-
-
-def _delete_spec_check_annots(doc) -> None:
-    for page in doc:
-        to_delete = []
-        for annot in page.annots() or []:
-            info = annot.info or {}
-            subj = info.get("subject") or ""
-            if subj.startswith(f"{SUBJECT_PREFIX}:"):
-                to_delete.append(annot)
-        for annot in to_delete:
-            page.delete_annot(annot)
-
-
-def _find_rect_on_page(page, terms: Iterable[str]):
-    for term in terms:
-        if not term:
-            continue
-        hits = page.search_for(term)
-        if hits:
-            return hits[0]
-    return None
-
-
-_FONT_SIZE = 14.0
-_BOX_W = 280.0
-_BOX_H = 22.0
-_LINE_HEIGHT = 18.0
-_BOX_PAD = 6.0
-_STACK_GAP = 2.0
-_GAP = 8.0
-_RED = (1.0, 0.0, 0.0)  # Bluebeam default "Red" swatch
-_RED_HEX = "#FF0000"
-_WHITE = (1.0, 1.0, 1.0)
-_MARGIN = 4.0
-
-
-def _box_size_for(comment: str) -> tuple[float, float]:
-    """Pick box w/h so 14pt Helv `comment` fits without clipping when wrapped."""
-    import fitz
-
-    width = _BOX_W
-    text = comment or ""
-    inner_w = width - 2 * _BOX_PAD
-    text_w = fitz.get_text_length(text, fontname="hebo", fontsize=_FONT_SIZE)
-    lines = max(1, int(-(-text_w // inner_w)))  # ceil division
-    height = lines * _LINE_HEIGHT + 2 * _BOX_PAD
-    return width, max(_BOX_H, height)
-
-
-def _place_box(page, anchor, w: float, h: float):
-    import fitz
-
-    pw, ph = page.rect.width, page.rect.height
-    candidates = [
-        fitz.Rect(anchor.x1 + _GAP, anchor.y0 - 2, anchor.x1 + _GAP + w, anchor.y0 - 2 + h),
-        fitz.Rect(anchor.x0 - _GAP - w, anchor.y0 - 2, anchor.x0 - _GAP, anchor.y0 - 2 + h),
-        fitz.Rect(anchor.x0, anchor.y1 + _GAP, anchor.x0 + w, anchor.y1 + _GAP + h),
-    ]
-    for box in candidates:
-        if box.x0 >= _MARGIN and box.x1 <= pw - _MARGIN and box.y0 >= _MARGIN and box.y1 <= ph - _MARGIN:
-            return box
-    box = candidates[0]
-    x0 = max(_MARGIN, min(box.x0, pw - w - _MARGIN))
-    y0 = max(_MARGIN, min(box.y0, ph - h - _MARGIN))
-    return fitz.Rect(x0, y0, x0 + w, y0 + h)
-
-
-def _stack_clear(box, existing, page_rect):
-    """If `box` overlaps any rect in `existing`, shift down until clear or off-page."""
-    import fitz
-
-    h = box.y1 - box.y0
-    step = h + _STACK_GAP
-    max_y = page_rect.y1 - _MARGIN
-    while any(box.intersects(b) for b in existing):
-        new_y0 = box.y0 + step
-        if new_y0 + h > max_y:
-            return box
-        box = fitz.Rect(box.x0, new_y0, box.x1, new_y0 + h)
-    return box
-
-
-def _pdf_date(dt: datetime) -> str:
-    return "D:" + dt.strftime("%Y%m%d%H%M%S") + "Z"
-
-
-def _rich_text_payload(comment: str, font_size: float, color_hex: str) -> tuple[str, str]:
-    """Return (/DS string, /RC XHTML) matching Bluebeam's native FreeText shape.
-
-    Bluebeam regenerates /AP from /DA on edit-mode toggle when /RC is absent,
-    causing a visible font-metric shift. Writing /RC + /DS gives Bluebeam an
-    explicit rich-text source so the appearance stays stable.
-    """
-    ds = (
-        f"font: bold {font_size:g}pt 'Helvetica-Bold',sans-serif; "
-        f"font-weight:bold; text-align:left; color:{color_hex}"
-    )
-    safe = html.escape(comment or "")
-    rc = (
-        '<?xml version="1.0"?>'
-        '<body xmlns="http://www.w3.org/1999/xhtml" '
-        'xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" '
-        'xfa:APIVersion="Acrobat:11.0.0" xfa:spec="2.0.2">'
-        '<p dir="ltr">'
-        f'<span style="font-size:{font_size:g}pt;font-family:Helvetica-Bold;'
-        f'font-weight:bold;color:{color_hex}">'
-        f'{safe}'
-        '</span></p></body>'
-    )
-    return ds, rc
-
-
-def _rgb_to_hex(rgb: tuple[float, float, float]) -> str:
-    return "#" + "".join(f"{int(round(c * 255)):02X}" for c in rgb)
-
-
 def emit_to_pdf(
     pdf_path: Path | str,
     manifest: list[dict],
@@ -457,31 +341,26 @@ def emit_to_pdf(
     output_path: Path | str | None = None,
     in_place: bool = False,
 ) -> EmitResult:
-    """Write manifest entries as red FreeText annotations via PyMuPDF (ADR-0012).
+    """Write manifest entries as red Revu-style FreeText callouts (ADR-0012).
 
     Each entry becomes a borderless red-text FreeText box placed adjacent to
     the first matching search term on the entry's page (falling back through
     `pages` if provided). Existing `spec-check:`-subject annotations are
-    deleted first so re-running produces no duplicates.
+    deleted first so re-running produces no duplicates. Styling and placement
+    live in `qc_core.markup`.
 
     Default output is `<source>.marked.pdf`; pass `in_place=True` to overwrite.
     """
     import fitz
 
     src = Path(pdf_path)
-    if not in_place and output_path is None:
-        out = src.with_name(f"{src.stem}.marked.pdf")
-    elif in_place:
-        out = src
-    else:
-        out = Path(output_path)
-
-    now_pdf = _pdf_date(datetime.now(timezone.utc))
+    out = markup.resolve_output_path(src, output_path, in_place)
+    now_pdf = markup.pdf_date()
     result = EmitResult(output_path=out)
     placed_by_page: dict[int, list] = {}
     doc = fitz.open(src)
     try:
-        _delete_spec_check_annots(doc)
+        markup.delete_markups(doc, SUBJECT_PREFIX)
 
         for entry in manifest:
             candidate_pages = entry.get("pages") or [entry["page"]]
@@ -492,7 +371,7 @@ def emit_to_pdf(
                 if not 0 <= pidx < doc.page_count:
                     continue
                 p = doc[pidx]
-                hit = _find_rect_on_page(p, entry.get("search_terms", []))
+                hit = markup.find_rect_on_page(p, entry.get("search_terms", []))
                 if hit is not None:
                     anchor = hit
                     page = p
@@ -501,53 +380,19 @@ def emit_to_pdf(
                 result.unmatched.append(entry)
                 continue
 
-            w, h = _box_size_for(entry.get("comment", ""))
-            box = _place_box(page, anchor, w, h)
-            existing = placed_by_page.setdefault(page.number, [])
-            box = _stack_clear(box, existing, page.rect)
-            existing.append(box)
-
-            annot = page.add_freetext_annot(
-                box,
-                entry.get("comment", ""),
-                fontsize=_FONT_SIZE,
-                fontname="HeBo",  # Helvetica-Bold
-                text_color=_RED,
-                # Solid white box at full opacity so red text stays legible over
-                # underlying linework/text (opacity stays global-opaque per #46).
-                fill_color=_WHITE,
-                align=fitz.TEXT_ALIGN_LEFT,
-            )
-            annot.set_border(width=0)
-            annot.set_info(
-                title=reviewer,
+            markup.add_freetext_markup(
+                doc,
+                page,
+                anchor,
+                comment=entry.get("comment", ""),
+                reviewer=reviewer,
                 subject=entry["subject"],
-                content=entry.get("comment", ""),
-                creationDate=now_pdf,
-                modDate=now_pdf,
+                now_pdf=now_pdf,
+                placed_by_page=placed_by_page,
             )
-            # Lock contents so Revu doesn't auto-refit text on edit-mode toggle.
-            annot.set_flags(annot.flags | fitz.PDF_ANNOT_IS_LOCKED_CONTENTS)
-            annot.update()
-
-            # Write /DS + /RC so Bluebeam doesn't regenerate /AP from /DA
-            # (which otherwise causes a font-metric shift on first click).
-            ds, rc = _rich_text_payload(
-                entry.get("comment", ""), _FONT_SIZE, _RED_HEX
-            )
-            doc.xref_set_key(annot.xref, "DS", f"({ds})")
-            doc.xref_set_key(annot.xref, "RC", f"({rc})")
-
             result.emitted += 1
 
-        if in_place:
-            tmp = src.with_suffix(src.suffix + ".tmp")
-            doc.save(tmp, deflate=True)
-            doc.close()
-            tmp.replace(src)
-        else:
-            doc.save(out, deflate=True)
-            doc.close()
+        markup.save_doc(doc, src, out, in_place)
     finally:
         if not doc.is_closed:
             doc.close()

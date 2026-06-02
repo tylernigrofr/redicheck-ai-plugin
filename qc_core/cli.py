@@ -22,6 +22,11 @@ from qc_core.spec import indexer, queries
 from qc_core.spec.kinds import SPEC_FINDING_KINDS
 
 
+# Default reviewer when neither --reviewer nor qc.config.toml supplies one.
+# Interim convenience until per-reviewer config is the norm.
+DEFAULT_REVIEWER = "REDICHECK-TKN"
+
+
 def _load_reviewer_from_config(project_folder: Path) -> str | None:
     cfg = project_folder / "qc.config.toml"
     if not cfg.is_file():
@@ -32,6 +37,15 @@ def _load_reviewer_from_config(project_folder: Path) -> str | None:
         return None
     reviewer = data.get("reviewer", {}).get("name")
     return reviewer if isinstance(reviewer, str) and reviewer else None
+
+
+def _resolve_reviewer(args) -> str:
+    """CLI flag > qc.config.toml > DEFAULT_REVIEWER."""
+    return (
+        args.reviewer
+        or _load_reviewer_from_config(Path(args.project_folder))
+        or DEFAULT_REVIEWER
+    )
 
 
 
@@ -125,6 +139,7 @@ def _door_check_preview(conn, project_folder: str | Path) -> None:
 
 
 def _door_emit(conn, args) -> int:
+    reviewer = _resolve_reviewer(args)
     rows = conn.execute(
         "SELECT id, pdf_path FROM drawing_volumes ORDER BY id"
     ).fetchall()
@@ -139,6 +154,7 @@ def _door_emit(conn, args) -> int:
         result = door_emit_mod.emit_to_pdf(
             pdf_path,
             manifest,
+            reviewer=reviewer,
             in_place=args.in_place,
         )
         total_emitted += result.emitted
@@ -163,7 +179,14 @@ def door_check_main(argv: list[str] | None = None) -> int:
         "--mode",
         choices=["preview", "emit"],
         default="preview",
-        help="preview: grouped door findings; emit: AVW cloudy markups via PyMuPDF (ADR-0012)",
+        help="preview: grouped door findings; emit: red FreeText callouts via PyMuPDF (ADR-0012)",
+    )
+    parser.add_argument(
+        "--reviewer",
+        help=(
+            "Author name on emitted annotations "
+            f"(default: qc.config.toml [reviewer] name, else {DEFAULT_REVIEWER})"
+        ),
     )
     parser.add_argument(
         "--accept-resolution",
@@ -296,13 +319,8 @@ def _format_finding(row: dict) -> str:
 
 
 def _emit(conn, args) -> int:
-    reviewer = args.reviewer or _load_reviewer_from_config(Path(args.project_folder))
-    if not reviewer:
-        print(
-            "ERROR: --reviewer required (or set [reviewer] name in qc.config.toml)",
-            file=sys.stderr,
-        )
-        return 2
+    reviewer = _resolve_reviewer(args)
+    kinds = args.kind or None
 
     rows = conn.execute(
         "SELECT id, pdf_path, toc_start, toc_end FROM spec_volumes ORDER BY id"
@@ -315,7 +333,9 @@ def _emit(conn, args) -> int:
         fmt = emit_mod.detect_section_format(
             pdf_path, int(row["toc_start"]), int(row["toc_end"] or row["toc_start"])
         )
-        manifest = emit_mod.build_manifest(conn, row["id"], section_format=fmt)
+        manifest = emit_mod.build_manifest(
+            conn, row["id"], section_format=fmt, kinds=kinds
+        )
         print(f"volume {row['id']}: detected section format = '{fmt}'")
         result = emit_mod.emit_to_pdf(
             pdf_path, manifest, reviewer=reviewer, in_place=args.in_place
@@ -347,7 +367,20 @@ def spec_check_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--reviewer",
-        help="Author name to set on emitted annotations (required for --mode=emit)",
+        help=(
+            "Author name on emitted annotations "
+            f"(default: qc.config.toml [reviewer] name, else {DEFAULT_REVIEWER})"
+        ),
+    )
+    parser.add_argument(
+        "--kind",
+        action="append",
+        choices=SPEC_FINDING_KINDS,
+        metavar="KIND",
+        help=(
+            "Restrict emit to this finding kind (repeatable). "
+            "Omit to emit all kinds. Choices: " + ", ".join(SPEC_FINDING_KINDS)
+        ),
     )
     parser.add_argument(
         "--in-place",
@@ -391,13 +424,8 @@ def spec_check_main(argv: list[str] | None = None) -> int:
 
 
 def _drawing_emit(conn, args) -> int:
-    reviewer = args.reviewer or _load_reviewer_from_config(Path(args.project_folder))
-    if not reviewer:
-        print(
-            "ERROR: --reviewer required (or set [reviewer] name in qc.config.toml)",
-            file=sys.stderr,
-        )
-        return 2
+    reviewer = _resolve_reviewer(args)
+    kinds = args.kind or None
 
     rows = conn.execute(
         "SELECT id, pdf_path FROM drawing_volumes ORDER BY id"
@@ -407,7 +435,7 @@ def _drawing_emit(conn, args) -> int:
     total_skipped = 0
     total_unmatched = 0
     for row in rows:
-        manifest = drawing_emit.build_manifest(conn, row["id"])
+        manifest = drawing_emit.build_manifest(conn, row["id"], kinds=kinds)
         if not manifest:
             continue
         pdf_path = Path(row["pdf_path"])
@@ -448,7 +476,20 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--reviewer",
-        help="Author name to set on emitted annotations (required for --mode=emit)",
+        help=(
+            "Author name on emitted annotations "
+            f"(default: qc.config.toml [reviewer] name, else {DEFAULT_REVIEWER})"
+        ),
+    )
+    parser.add_argument(
+        "--kind",
+        action="append",
+        choices=DRAWING_FINDING_KINDS,
+        metavar="KIND",
+        help=(
+            "Restrict emit to this finding kind (repeatable). "
+            "Omit to emit all kinds. Choices: " + ", ".join(DRAWING_FINDING_KINDS)
+        ),
     )
     parser.add_argument(
         "--in-place",
