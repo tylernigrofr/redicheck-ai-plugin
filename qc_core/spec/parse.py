@@ -181,13 +181,28 @@ def is_by_consultant(title: str) -> bool:
     return bool(CONSULTANT_RE.search(title))
 
 
+_TOC_BOOKMARK_RE = re.compile(
+    r"table\s+of\s+contents|specification\s+index", re.IGNORECASE
+)
+_SECTION_BOOKMARK_RE = re.compile(r"\d{2}\s*\d{2}\s*\d{2}")
+
+
+def _bookmark_looks_like_toc(title: str) -> bool:
+    """Recognize project-TOC bookmark titles, including numeric-prefixed
+    variants (``3_TOC``) and bare ``TOC``, not just ``Table of Contents``."""
+    norm = re.sub(r"^\s*\d+[_.\s)\-]+", "", title.strip()).strip()
+    return norm.lower() == "toc" or bool(_TOC_BOOKMARK_RE.search(norm))
+
+
 def _detect_toc_from_outline(doc) -> Optional[tuple[int, int]]:
     """Use PDF outline bookmarks as authoritative TOC range when present.
 
-    Looks for a bookmark titled "Table of Contents" (case-insensitive, at any
-    outline level). Returns (toc_start, toc_end) as 0-based page indices: the
-    bookmark's page through one before the next sibling/deeper bookmark, capped
-    so the range is at least the TOC page itself.
+    Among bookmarks whose title looks like a TOC, prefers the shallowest
+    (document-level) one and skips any nested under a spec-section bookmark —
+    those are embedded sub-document TOCs (e.g. a geotechnical report's own TOC)
+    rather than the project specification index. Returns (toc_start, toc_end) as
+    0-based page indices: the bookmark's page through one before the next
+    sibling/deeper bookmark, capped so the range is at least the TOC page itself.
     """
     try:
         outline = doc.get_toc(simple=True)
@@ -197,34 +212,66 @@ def _detect_toc_from_outline(doc) -> Optional[tuple[int, int]]:
         return None
 
     n = len(doc)
+    candidates: list[tuple[int, int, int]] = []  # (level, page, idx)
+    ancestors: list[tuple[int, bool]] = []  # (level, is_section_bookmark)
     for idx, (level, title, page) in enumerate(outline):
-        if not title:
+        while ancestors and ancestors[-1][0] >= level:
+            ancestors.pop()
+        nested_under_section = any(is_section for _lvl, is_section in ancestors)
+        is_section = bool(title and _SECTION_BOOKMARK_RE.search(title))
+        ancestors.append((level, is_section))
+        if not title or nested_under_section:
             continue
-        norm = title.strip().lower()
-        if norm != "table of contents":
+        if _bookmark_looks_like_toc(title):
+            candidates.append((level, page, idx))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    level, page, idx = candidates[0]
+
+    toc_page_0 = max(0, page - 1)
+    next_page_0: Optional[int] = None
+    for level2, _title2, page2 in outline[idx + 1 :]:
+        if level2 > level:
             continue
-        toc_page_0 = max(0, page - 1)
-        next_page_0: Optional[int] = None
-        for level2, _title2, page2 in outline[idx + 1 :]:
-            if level2 > level:
-                continue
+        if page2 > page:
+            next_page_0 = max(0, page2 - 1)
+            break
+    if next_page_0 is None:
+        for _level2, _title2, page2 in outline[idx + 1 :]:
             if page2 > page:
                 next_page_0 = max(0, page2 - 1)
                 break
-        if next_page_0 is None:
-            for _level2, _title2, page2 in outline[idx + 1 :]:
-                if page2 > page:
-                    next_page_0 = max(0, page2 - 1)
-                    break
-        if next_page_0 is None or next_page_0 <= toc_page_0:
-            return (toc_page_0, min(toc_page_0, n - 1))
-        return (toc_page_0, min(next_page_0 - 1, n - 1))
-    return None
+    if next_page_0 is None or next_page_0 <= toc_page_0:
+        return (toc_page_0, min(toc_page_0, n - 1))
+    return (toc_page_0, min(next_page_0 - 1, n - 1))
+
+
+def _toc_page_density(doc, start_0: int) -> int:
+    """Count section-number lines across the TOC's first few pages, used to
+    sanity-check an outline-derived range against the text-scan candidate."""
+    n = len(doc)
+    if start_0 < 0 or start_0 >= n:
+        return 0
+    count = 0
+    for i in range(start_0, min(start_0 + 3, n)):
+        for line in doc[i].get_text().split("\n"):
+            stripped = line.strip()
+            if is_bare_section_number(stripped) or re.match(
+                r"^\d{2}[\s.]\d{2}[\s.]\d{2}(?:\.\d+)?\s+\S", stripped
+            ):
+                count += 1
+    return count
 
 
 def detect_toc_range(doc) -> tuple[int, int]:
     from_outline = _detect_toc_from_outline(doc)
-    if from_outline is not None:
+    # Trust the outline only when its TOC page is actually dense with section
+    # numbers; a sparse range usually means we latched onto the wrong bookmark,
+    # so fall back to the text scan below and compare.
+    if from_outline is not None and _toc_page_density(doc, from_outline[0]) >= 5:
         return from_outline
 
     n = len(doc)
@@ -263,6 +310,8 @@ def detect_toc_range(doc) -> tuple[int, int]:
             toc_start = best_page
 
     if toc_start is None:
+        if from_outline is not None:
+            return from_outline
         return (0, min(9, n - 1))
 
     toc_end = toc_start
@@ -321,11 +370,34 @@ def detect_toc_range(doc) -> tuple[int, int]:
             if consecutive_low >= 2 and i > toc_start:
                 break
 
+    # If the outline produced a range too, keep whichever first page is denser.
+    if from_outline is not None and _toc_page_density(
+        doc, from_outline[0]
+    ) > _toc_page_density(doc, toc_start):
+        return from_outline
     return (toc_start, toc_end)
+
+
+def _running_header_lines(doc, toc_start: int, toc_end: int) -> set[str]:
+    """Lines repeated across multiple TOC pages are running headers/footers
+    (e.g. a project title block), not section entries. A real section number or
+    title appears on a single page, so repetition is a reliable signal."""
+    npages = toc_end - toc_start + 1
+    if npages < 2:
+        return set()
+    pages_seen: dict[str, set[int]] = {}
+    for page_idx in range(toc_start, toc_end + 1):
+        for line in doc[page_idx].get_text().split("\n"):
+            stripped = line.strip()
+            if stripped:
+                pages_seen.setdefault(stripped, set()).add(page_idx)
+    threshold = max(2, (npages + 1) // 2)
+    return {line for line, pages in pages_seen.items() if len(pages) >= threshold}
 
 
 def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
     found: dict[str, dict] = {}
+    running_headers = _running_header_lines(doc, toc_start, toc_end)
 
     for page_idx in range(toc_start, toc_end + 1):
         text = doc[page_idx].get_text()
@@ -337,6 +409,9 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
             _, line = nonempty[i]
             lower = line.lower()
 
+            if line in running_headers:
+                i += 1
+                continue
             if TOC_HEADING_RE.search(line):
                 i += 1
                 continue
