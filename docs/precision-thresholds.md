@@ -121,7 +121,68 @@ These don't show up in the FP/FN table because the curation matched them, but th
 
 - **Broken-ref mentions misread as body sections.** Quarry Oaks' `31 20 00` "Earth Moving" came from this — the body extractor picked up an in-text mention of a referenced section number and treated it as a section header. Kadlec has a different class of the same kind of bug (TOC running-header artifacts, also documented in its `expected.json` as `suppress`). Worth investigating whether the body-section detector can use surrounding-line layout signals to filter these.
 
+- **(Resolved 2026-06-10, #58)** Sub-consultant ("by B&A") body sections misread as missing from body. Sub-consultant volumes (B&A, Nudge Design, Oldner Lighting on Centro East Block; the DFD point-summary tables on Juvenile) lay out the first page with the title in an ALL-CAPS page header and *no* dashed `SECTION NN NN NN - TITLE` line — the number lives only in the title-block page-number line (`26 05 53 - 1`, our running-header pattern). The body detector now falls back to that authoritative running-header number on a genuine first page (counter == 1) when no header line matched, binding the ALL-CAPS title above it. On Centro this cleared the false `toc_not_in_body` for 26 05 53 / 26 41 13 / 28 30 00 and surfaced real defects (the 26 20 00↔26 22 00 footer typo, a `23 05 48.13`/`23 05 48` minor-number mismatch, and a duplicate `26 25 00` shared by two different sub-consultant sections). On Juvenile it removed the false `toc_not_in_body:23 09 15` (the DDC Input/Output point-summary tables, pp.270–301, *are* that section). Pages where a header DID match — including mis-numbered ones (#44) — are left untouched, so the typo/`.13` discrepancies still reconcile through the matrix (#59/#60) rather than being silently rewritten.
+
 - **(Resolved 2026-05-21)** Architectural area-suffix splits treated as un-indexed sheets. The original symptom on Kadlec — `AD101.A/.B`, `A-111.B`, `A-120.B`, `A-151.A/.B` firing `sheet_in_set_not_in_index` — turned out to be two stacked bugs: (1) `_LINE_SHEET_RE` rejected `.<letter>` suffixes so the index parser never read those rows; (2) when the index DID list only a base sheet, the cross-check didn't treat `<base>.<suffix>` in the set as covered. Both fixed in the regex + a new `_index_covers` helper in [qc_core/drawing/indexer.py](../qc_core/drawing/indexer.py).
+
+## Judgment-node decision scoring (ADR-0026, added 2026-06-10)
+
+ADR-0026 §7 adds a second assertion mode: judgment nodes are scored on
+**decision** precision/recall against decision-level labels, with tolerance
+(must hit known-correct calls; net-new calls surface for review rather than
+auto-failing; rationale wording is never asserted).
+
+**Label home (v1):** each fixture's drawing test file carries an
+`EXPECTED_JUDGMENT_WORKLIST` (the set of `(invariant, scope)` pairs that must
+trip) and an `EXPECTED_DECISION` note recording the curated correct judgment.
+When labels outgrow this, they move into `expected.json` as a
+`judgment_decisions` list with the same content.
+
+### 2026-06-10 baseline (drawing-index reconciliation node)
+
+| Fixture | Worklist | Correct decision |
+|---|---|---|
+| kadlec-lab | empty | n/a |
+| embassy-suites-clearwater | empty | n/a |
+| lakeshore-center | empty | n/a |
+| quarry-oaks | 5 × `prefix_absent_from_index` (C, E, LI, M, P) | real omission — promote held findings |
+| juvenile-correctional | 12 × `prefix_absent_from_set` (legend codes) | parse noise — resolve, nothing to promote |
+
+**Cold validation (HOP Plaza 2, 2026-06-10):** first run on a never-seen
+project, zero parser edits. 234 sheets, bookmark parse 100%, no invariants
+tripped, 2 disputed matrix rows — both verified real against the PDF (index
+lists a phantom `P4.01`; `E4.02` exists but is unlisted). This is the
+no-parser-edits success criterion for the harness model holding on its first
+cold project.
+
+**Ratchet status:** deterministic-baseline agreement is 17/17 worklist items
+across 5 fixtures + 1 cold project, but decisions span only 2 distinct
+decision shapes so far — below the ≥20-decision / ≥4-fixture bar in
+ADR-0026 §2 for demoting the reconciliation node. Claude stays in the loop.
+
+### 2026-06-10 baseline (spec-check reconciliation node, #63)
+
+The spec instantiation of the same harness ([qc_core/spec/matrix.py](../qc_core/spec/matrix.py)):
+channels {TOC, body, related-ref targets}, entity-key = CSI section number, two
+invariants — `toc_channel_empty` (a volume with a body but no confirmed TOC, the
+#52 phantom-TOC trap) and `division_absent_from_toc` (a division well-represented
+in the body with zero TOC coverage). A tripped invariant holds the affected
+`body_not_in_toc` conclusions at `status='evidence'` and blocks `spec-check
+--mode=emit` (exit 2) until judged. Labels live in each spec fixture's test file
+as `EXPECTED_SPEC_JUDGMENT_WORKLIST` / `EXPECTED_SPEC_DECISION`.
+
+| Fixture | Worklist | Correct decision |
+|---|---|---|
+| quarry-oaks | empty | n/a |
+| juvenile-correctional | empty | n/a |
+| kadlec-lab | 2 × `division_absent_from_toc` (31, 33) | real omission — promote held findings |
+
+The `toc_channel_empty` invariant is exercised synthetically in
+`tests/test_spec_matrix.py` (no TOC-less project is in the fixture corpus yet).
+
+**Ratchet status:** spec adds 2 worklist items in 1 shape (promote); combined
+drawing+spec the decision corpus is still 2 distinct shapes (promote / resolve).
+Claude stays in the loop on both checks.
 
 ## Default-flip status
 

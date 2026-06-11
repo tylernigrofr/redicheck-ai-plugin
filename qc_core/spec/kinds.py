@@ -11,4 +11,7 @@ SPEC_FINDING_KINDS = (
     "title_mismatch_across_volumes",
     "duplicate_section_number",
     "duplicate_section_number_and_name",
+    "spec_toc_absent",
+    "incomplete_placeholder",
+    "unresolved_option_bracket",
 )

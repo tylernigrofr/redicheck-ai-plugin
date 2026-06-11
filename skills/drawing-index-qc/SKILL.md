@@ -15,6 +15,8 @@ in the Drawing Set.
 ```bash
 qc-index <project-folder>
 drawing-index-qc <project-folder> --mode=preview
+drawing-index-qc <project-folder> --mode=matrix
+drawing-index-qc <project-folder> --apply-judgments decisions.json
 drawing-index-qc <project-folder> --mode=emit --reviewer "Your Name"
 drawing-index-qc <project-folder> --mode=emit --kind sheet_in_index_not_in_set
 ```
@@ -28,8 +30,35 @@ Default `--mode=preview`. The flip to `emit` is deferred — see [precision-thre
 ## Behavior
 
 - Auto-runs `qc-index` when `qc.sqlite` is missing or stale (spec or drawing PDFs).
-- **preview**: prints drawing findings grouped by `kind` from `qc.sqlite`.
-- **emit**: writes one red Revu-style FreeText callout per finding via PyMuPDF (ADR-0012) — the same markup style as spec-check (`qc_core.markup`). Reviewer falls back to `qc.config.toml [reviewer] name`, else the built-in default `REDICHECK-TKN`. Default output is `<name>.marked.pdf`; pass `--in-place` to overwrite sources.
+- **preview**: prints drawing findings grouped by `kind` from `qc.sqlite`. Shows an UNTRUSTED SCOPE banner when invariants are tripped or Evidence is pending.
+- **matrix**: prints the judgment-node worklist as JSON — tripped invariants, findings at `status=evidence`, and disputed reconciliation-matrix rows (ADR-0026).
+- **emit**: writes one red Revu-style FreeText callout per finding via PyMuPDF (ADR-0012) — the same markup style as spec-check (`qc_core.markup`). Reviewer falls back to `qc.config.toml [reviewer] name`, else the built-in default `REDICHECK-TKN`. Default output is `<name>.marked.pdf`; pass `--in-place` to overwrite sources. **Exits 2 without writing** when any invariant is tripped or any Evidence is unjudged — you cannot sign off on a list with known completeness gaps (ADR-0026 §6a).
+
+## Harness loop (ADR-0026)
+
+This skill is the deterministic harness; you (Claude) fill the judgment nodes. The loop shape is fixed — do not free-drive it:
+
+1. Run `drawing-index-qc <project> --mode=matrix`.
+2. If `invariants` has tripped rows or `pending_evidence` is non-empty, **judge each disputed item**. For every tripped invariant, open the source PDF page(s) in the `detail` (e.g. via `qc_core` helpers or `PyMuPDF`) and determine what actually happened: real omission, parse gap, sub-project set, parse noise. For every `pending_evidence` finding, decide using its matrix row (`disputed_rows`).
+3. Write a decisions file and apply it: `drawing-index-qc <project> --apply-judgments decisions.json`. Schema:
+
+   ```json
+   {
+     "decisions": [
+       {"evidence_key": "S4.1", "action": "promote|dismiss|reclassify",
+        "kind": "<required for reclassify>",
+        "rationale": "one line, grounded in what you read on the page"}
+     ],
+     "invariants": [
+       {"id": 3, "status": "resolved", "rationale": "what the investigation found"}
+     ]
+   }
+   ```
+
+   `resolved` = you investigated and judged; `overridden` = the Reviewer made the call (ADR-0024 Resolution). Never resolve an invariant without reading the page it points at; never dismiss Evidence without a rationale. If a parse gap is the cause, the dismissal rationale is the labeled example that improves discovery later — be specific.
+4. Re-run `--mode=preview`; when the UNTRUSTED banner is gone, proceed to triage/emit as usual.
+
+Judgments persist in `qc.sqlite` — re-runs on an unchanged Drawing Set do not re-ask.
 
 ## Emit conventions (ADR-0012)
 

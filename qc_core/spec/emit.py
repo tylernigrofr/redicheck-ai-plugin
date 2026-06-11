@@ -74,6 +74,8 @@ _SUBJECT_BY_KIND = {
     "division_referenced_but_not_included": f"{SUBJECT_PREFIX}:division-excluded",
     "duplicate_section_number": f"{SUBJECT_PREFIX}:duplicate-section-number",
     "duplicate_section_number_and_name": f"{SUBJECT_PREFIX}:duplicate-section-number-and-name",
+    "incomplete_placeholder": f"{SUBJECT_PREFIX}:incomplete-placeholder",
+    "unresolved_option_bracket": f"{SUBJECT_PREFIX}:unresolved-option-bracket",
 }
 _DIVISION_MISSING_SUBJECT = f"{SUBJECT_PREFIX}:division-missing-from-toc"
 
@@ -166,6 +168,22 @@ def _toc_range(conn: sqlite3.Connection, volume_id: int) -> tuple[int, int]:
     return (int(row[0]), int(row[1] or row[0]))
 
 
+def _anchor_pages(
+    conn: sqlite3.Connection, volume_id: int, anchor_page: int
+) -> list[int]:
+    """Anchor page first, then the volume's full TOC range as fallback.
+
+    Stored toc_page values come from the TOC equivalence-class representative
+    (ADR-0013); on a sibling volume whose TOC pagination differs (Centro East
+    Block Vol 2 is shifted two pages, #62) the representative's page misses.
+    Searching the whole TOC range anchors on where the text actually is.
+    """
+    toc_start, toc_end = _toc_range(conn, volume_id)
+    pages = [anchor_page]
+    pages.extend(p for p in range(toc_start, toc_end + 1) if p != anchor_page)
+    return pages
+
+
 def build_manifest(
     conn: sqlite3.Connection,
     volume_id: int,
@@ -185,7 +203,8 @@ def build_manifest(
     kind_list = list(kinds) if kinds is not None else None
     query = (
         "SELECT * FROM findings "
-        "WHERE volume_id = ? AND expected_action = 'emit_markup'"
+        "WHERE volume_id = ? AND expected_action = 'emit_markup' "
+        "AND status IN ('candidate', 'accepted')"
     )
     params: list = [volume_id]
     if kind_list:
@@ -216,7 +235,19 @@ def build_manifest(
 
         if kind == "broken_related_ref":
             terms = section_variants(r["to_section"])
-            comment = f"CNL section {format_section(r['to_section'], fmt)}"
+            tags = (r["ref_class"] or "").split(",")
+            suggestion = r["probable_match"]
+            if "ir" in tags and suggestion:
+                comment = f"IR ({format_section(suggestion, fmt)})"
+            elif ("suffix" in tags or "digit_typo" in tags) and suggestion:
+                comment = (
+                    f"CNL section {format_section(r['to_section'], fmt)} — "
+                    f"should this be {format_section(suggestion, fmt)}?"
+                )
+            else:
+                comment = f"CNL section {format_section(r['to_section'], fmt)}"
+            if "typical" in tags:
+                comment += " Typical"
             entries.append({
                 "kind": kind,
                 "subject": subject,
@@ -243,6 +274,7 @@ def build_manifest(
                 "subject": subject,
                 "comment": comment,
                 "page": anchor_page,
+                "pages": _anchor_pages(conn, volume_id, anchor_page),
                 "search_terms": terms,
                 "idempotency_key": f"{subject}|{missing}|anchor:{anchor}",
             })
@@ -257,6 +289,7 @@ def build_manifest(
                 "subject": subject,
                 "comment": comment,
                 "page": anchor_page,
+                "pages": _anchor_pages(conn, volume_id, anchor_page),
                 "search_terms": terms,
                 "idempotency_key": f"{subject}|{section}|toc:{anchor_page}",
             })
@@ -276,22 +309,44 @@ def build_manifest(
             })
 
         elif kind == "section_number_mismatch":
-            # Mark the mis-numbered body header (r["section"]); the correct
-            # number from the TOC is in probable_match.
             body_num = r["section"] or ""
-            correct = r["probable_match"] or ""
-            comment = (
-                f"Section number {format_section(body_num, fmt)} should be "
-                f"{format_section(correct, fmt)}"
-            )
-            entries.append({
-                "kind": kind,
-                "subject": subject,
-                "comment": comment,
-                "page": r["body_page"],
-                "search_terms": section_variants(body_num),
-                "idempotency_key": f"{subject}|{body_num}->{correct}",
-            })
+            toc_num = r["probable_match"] or ""
+            basis = r["context"] or "title"
+            if basis in ("suffix", "digit_typo"):
+                # Near-variant numbers (#60): neither side is provably right,
+                # so emit a linked two-sided AVW callout — one on the TOC
+                # entry, one on the body header — instead of a correction.
+                entries.append({
+                    "kind": kind,
+                    "subject": subject,
+                    "comment": f"AVW section {format_section(body_num, fmt)}",
+                    "page": r["toc_page"],
+                    "search_terms": section_variants(toc_num),
+                    "idempotency_key": f"{subject}|{body_num}<->{toc_num}|toc",
+                })
+                entries.append({
+                    "kind": kind,
+                    "subject": subject,
+                    "comment": f"AVW TOC {format_section(toc_num, fmt)}",
+                    "page": r["body_page"],
+                    "search_terms": section_variants(body_num),
+                    "idempotency_key": f"{subject}|{body_num}<->{toc_num}|body",
+                })
+            else:
+                # Title match: the mis-numbered body header is the defect; the
+                # correct number from the TOC is in probable_match.
+                comment = (
+                    f"Section number {format_section(body_num, fmt)} should be "
+                    f"{format_section(toc_num, fmt)}"
+                )
+                entries.append({
+                    "kind": kind,
+                    "subject": subject,
+                    "comment": comment,
+                    "page": r["body_page"],
+                    "search_terms": section_variants(body_num),
+                    "idempotency_key": f"{subject}|{body_num}->{toc_num}",
+                })
 
         elif kind in ("duplicate_section_number", "duplicate_section_number_and_name"):
             section = r["section"] or ""
@@ -306,8 +361,22 @@ def build_manifest(
                 "subject": subject,
                 "comment": comment,
                 "page": anchor_page,
+                "pages": _anchor_pages(conn, volume_id, anchor_page),
                 "search_terms": section_variants(section),
                 "idempotency_key": f"{subject}|{section}",
+            })
+
+        elif kind in ("incomplete_placeholder", "unresolved_option_bracket"):
+            # Anchor on the on-page placeholder token (stored in context); the
+            # body page is the only candidate (no TOC drift to chase).
+            token = r["context"] or ""
+            entries.append({
+                "kind": kind,
+                "subject": subject,
+                "comment": r["client_comment"] or "",
+                "page": r["body_page"],
+                "search_terms": [token] if token else [],
+                "idempotency_key": f"{subject}|p{r['body_page']}|{token}",
             })
 
     for div in sorted(rolled_divisions):
@@ -327,6 +396,7 @@ def build_manifest(
             "subject": _DIVISION_MISSING_SUBJECT,
             "comment": comment,
             "page": anchor_page,
+            "pages": _anchor_pages(conn, volume_id, anchor_page),
             "search_terms": section_variants(anchor),
             "idempotency_key": f"{_DIVISION_MISSING_SUBJECT}|div{div}",
         })
@@ -363,7 +433,14 @@ def emit_to_pdf(
         markup.delete_markups(doc, SUBJECT_PREFIX)
 
         for entry in manifest:
-            candidate_pages = entry.get("pages") or [entry["page"]]
+            candidate_pages = list(entry.get("pages") or [entry["page"]])
+            # Anchor pages computed from stored toc_page can drift by one
+            # against the physical PDF (Centro East Block, #62): fall back to
+            # the adjacent pages before declaring the entry unmatched.
+            for pnum in list(candidate_pages):
+                for neighbor in (int(pnum) - 1, int(pnum) + 1):
+                    if neighbor not in candidate_pages:
+                        candidate_pages.append(neighbor)
             anchor = None
             page = None
             for pnum in candidate_pages:

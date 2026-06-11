@@ -46,6 +46,7 @@ def index_drawing_pdf(
     force: bool = False,
     config=None,
     project_bookmark_prefixes: set[str] | None = None,
+    project_sheet_keys: set[str] | None = None,
 ) -> dict:
     """Parse one drawing PDF into drawing_volumes, sheets, and index entries."""
     from qc_core.discovery import drawing_set_pattern
@@ -72,7 +73,10 @@ def index_drawing_pdf(
         }
 
     result = analyze_pdf(
-        path, config=config, project_bookmark_prefixes=project_bookmark_prefixes
+        path,
+        config=config,
+        project_bookmark_prefixes=project_bookmark_prefixes,
+        project_sheet_keys=project_sheet_keys,
     )
     if not result.get("success"):
         raise RuntimeError(result.get("error", "Drawing PDF analysis failed"))
@@ -178,8 +182,8 @@ def _insert_finding(
         """
         INSERT INTO findings (
             drawing_volume_id, kind, expected_action, severity,
-            sheet_number, title, source_page, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            sheet_number, title, source_page, notes, evidence_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             drawing_volume_id,
@@ -190,6 +194,7 @@ def _insert_finding(
             title,
             source_page,
             notes,
+            normalize_sheet_number(sheet_number) if sheet_number else None,
         ),
     )
 
@@ -232,8 +237,19 @@ def _emit_sheet_discipline_review_findings(conn: sqlite3.Connection) -> None:
 
 
 def compute_drawing_findings(conn: sqlite3.Connection) -> None:
-    """Project-level cross-ref: index vs bookmark catalog (ADR-0014)."""
+    """Project-level cross-ref: index vs bookmark catalog (ADR-0014).
+
+    ADR-0026: the channel data is first persisted as the reconciliation
+    matrix and the fail-loud invariants are evaluated over it. The set
+    algebra below is the deterministic baseline verdict; findings on scopes
+    with a tripped, unresolved invariant are held at status='evidence'
+    (pending judgment) instead of concluding as Candidates.
+    """
+    from qc_core.drawing import matrix as drawing_matrix
+
     _clear_drawing_findings(conn)
+    drawing_matrix.build_matrix(conn)
+    drawing_matrix.evaluate_invariants(conn)
 
     volumes = {
         r["id"]: r["pdf_path"]
@@ -336,7 +352,12 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
                     notes="master_index",
                 )
                 flagged_master_missing.add(key)
-        _flag_duplicates(master_entries, master_vol_id, "master_index")
+        # Per volume: with a sub-set master in play (#54), the same sheet
+        # legitimately appears in its own volume's master only — but flagging
+        # across the union would mark any main-vs-sub overlap as a duplicate.
+        for (vol_id, source), entries in entries_by_volume_source.items():
+            if source == "master_index":
+                _flag_duplicates(entries, vol_id, "master_index")
 
     from qc_core.drawing.parse import _SHEET_PREFIX_RE
 
@@ -474,6 +495,33 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
 
     _emit_sheet_discipline_review_findings(conn)
 
+    # Hold baseline verdicts on untrusted scopes at Evidence (ADR-0026 §6a):
+    # a tripped invariant means parse-completeness on that prefix is suspect,
+    # so the deterministic conclusion cannot be presented as a Candidate.
+    untrusted = drawing_matrix.tripped_scopes(conn)
+    if untrusted:
+        from qc_core.drawing.matrix import _prefix_of
+
+        reconciliation_kinds = (
+            "sheet_in_index_not_in_set",
+            "sheet_in_set_not_in_index",
+            "duplicate_sheet_number",
+        )
+        placeholders = ",".join("?" * len(reconciliation_kinds))
+        rows = conn.execute(
+            f"SELECT id, sheet_number FROM findings WHERE kind IN ({placeholders})",
+            reconciliation_kinds,
+        ).fetchall()
+        held = [
+            r["id"] for r in rows if _prefix_of(r["sheet_number"] or "") in untrusted
+        ]
+        if held:
+            id_marks = ",".join("?" * len(held))
+            conn.execute(
+                f"UPDATE findings SET status = 'evidence' WHERE id IN ({id_marks})",
+                held,
+            )
+
 
 def index_project(
     project_folder: str | Path,
@@ -503,6 +551,7 @@ def index_project(
             fitz = None  # type: ignore[assignment]
 
         project_prefixes: set[str] = set()
+        project_sheet_keys: set[str] = set()
         if fitz is not None:
             for vol in volumes:
                 try:
@@ -514,6 +563,9 @@ def index_project(
                 finally:
                     doc.close()
                 project_prefixes |= _prefixes(s["sheet_number"] for s in bookmarks)
+                project_sheet_keys |= {
+                    normalize_sheet_number(s["sheet_number"]) for s in bookmarks
+                }
 
         summaries: list[dict] = []
         any_reindexed = False
@@ -524,6 +576,7 @@ def index_project(
                 force=force,
                 config=config,
                 project_bookmark_prefixes=project_prefixes,
+                project_sheet_keys=project_sheet_keys,
             )
             summaries.append(summary)
             if summary.get("indexed"):

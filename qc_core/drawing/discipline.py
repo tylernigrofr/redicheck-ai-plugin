@@ -5,11 +5,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# Fire Protection / Mechanical / Plumbing are distinct disciplines (#55);
+# "Mechanical/Plumbing" survives only as the combined label for genuinely
+# combined MEP volumes where the sheet prefix cannot split them.
 CANONICAL_DISCIPLINES = frozenset(
     {
         "Civil",
         "Structural",
         "Architectural",
+        "Fire Protection",
+        "Mechanical",
+        "Plumbing",
         "Mechanical/Plumbing",
         "Electrical",
         "Food Service",
@@ -33,16 +39,17 @@ _MULTI = sorted(
         ("EL", "Electrical"),
         ("EC", "Electrical"),
         ("ES", "Electrical"),
-        ("FP", "Mechanical/Plumbing"),
-        ("MD", "Mechanical/Plumbing"),
-        ("ME", "Mechanical/Plumbing"),
-        ("MF", "Mechanical/Plumbing"),
-        ("MH", "Mechanical/Plumbing"),
-        ("MR", "Mechanical/Plumbing"),
-        ("MV", "Mechanical/Plumbing"),
-        ("MC", "Mechanical/Plumbing"),
+        ("FP", "Fire Protection"),
+        ("MD", "Mechanical"),
+        ("ME", "Mechanical"),
+        ("MF", "Mechanical"),
+        ("MH", "Mechanical"),
+        ("MR", "Mechanical"),
+        ("MV", "Mechanical"),
+        ("MC", "Mechanical"),
         ("MP", "Mechanical/Plumbing"),
-        ("PS", "Mechanical/Plumbing"),
+        ("MEP", "Mechanical/Plumbing"),
+        ("PS", "Plumbing"),
         ("LI", "Civil"),
         ("CW", "Architectural"),
         ("CV", "Civil"),
@@ -80,13 +87,13 @@ _TITLE_KEYS = (
     ("STRUCTURAL NOTES", "Structural"),
     ("STRUCTURAL PLAN", "Structural"),
     ("STRUCTURAL DETAIL", "Structural"),
-    (" FIRE PROTECTION", "Mechanical/Plumbing"),
-    ("FIRE PROTECTION", "Mechanical/Plumbing"),
-    ("SPRINKLER", "Mechanical/Plumbing"),
-    (" HVAC", "Mechanical/Plumbing"),
-    ("MECHANICAL", "Mechanical/Plumbing"),
-    (" RECIRCULATION", "Mechanical/Plumbing"),
-    (" PLUMBING", "Mechanical/Plumbing"),
+    (" FIRE PROTECTION", "Fire Protection"),
+    ("FIRE PROTECTION", "Fire Protection"),
+    ("SPRINKLER", "Fire Protection"),
+    (" HVAC", "Mechanical"),
+    ("MECHANICAL", "Mechanical"),
+    (" RECIRCULATION", "Plumbing"),
+    (" PLUMBING", "Plumbing"),
     (" DEMOLISH", "Architectural"),
     ("DEMOLISH", "Architectural"),
     ("DEMO PLAN", "Architectural"),
@@ -102,8 +109,8 @@ _VOL_STRIP_RE = re.compile(r"(?i)^\d{2}[-_\s]+")
 _SINGLE = {
     "A": "Architectural",
     "E": "Electrical",
-    "M": "Mechanical/Plumbing",
-    "P": "Mechanical/Plumbing",
+    "M": "Mechanical",
+    "P": "Plumbing",
     "S": "Structural",
     "C": "Civil",
     "L": "Civil",
@@ -111,7 +118,7 @@ _SINGLE = {
     "I": "Architectural",
     "T": "Electrical",
     "K": "Food Service",
-    "F": "Mechanical/Plumbing",
+    "F": "Fire Protection",
 }
 
 
@@ -119,6 +126,8 @@ def title_discipline_hint(title: str | None) -> str | None:
     if not title:
         return None
     up = title.upper()
+    if "MECHANICAL" in up and "PLUMBING" in up:
+        return "Mechanical/Plumbing"
     for needle, disc in _TITLE_KEYS:
         if needle in up:
             return disc
@@ -210,8 +219,10 @@ def normalize_volume_hint(raw: str | None) -> str | None:
         return "Architectural"
     if lc.startswith("04-food") or "food service" in lc:
         return "Food Service"
+    if "fire protection" in lc or "fireprotection" in nospace:
+        return "Fire Protection"
     if lc.startswith("07-mechanical"):
-        return "Mechanical/Plumbing"
+        return "Mechanical"
     if lc.startswith("12 electrical") or lc.startswith("12-electrical"):
         return "Electrical"
     if "interiors" in lc or " interior" in lc or lc.startswith("13-interiors"):
@@ -226,10 +237,12 @@ def normalize_volume_hint(raw: str | None) -> str | None:
         return "Architectural"
     if any(x in lc for x in ("electrical", "lighting")):
         return "Electrical"
+    if "mechanical" in lc and "plumbing" in lc:
+        return "Mechanical/Plumbing"
     if "mechanical" in lc:
-        return "Mechanical/Plumbing"
+        return "Mechanical"
     if "plumbing" in lc:
-        return "Mechanical/Plumbing"
+        return "Plumbing"
     if any(x in lc for x in ("communication", "communications", "security", "technology")):
         return "Electrical"
     return None

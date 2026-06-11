@@ -104,11 +104,22 @@ def _collapse_letterspacing(text: str) -> str:
     return out
 
 
+# Fallback index-header form (#54): SMHa heads its master-index table
+# "BUILDING DRAWINGS" with no INDEX word anywhere on the page (Azalea Phase 4
+# main and "- Shed" volumes). Consulted only when no page matches the primary
+# patterns, so it can never redirect an existing detection.
+INDEX_PAGE_FALLBACK_RE = re.compile(r"\bBUILDING\s+DRAWINGS\b", re.IGNORECASE)
+
+
 def find_index_page(doc: fitz.Document, *, max_pages: int = 15) -> Optional[int]:
     """1-based page number with index header, or None (method B)."""
     for i in range(min(max_pages, doc.page_count)):
         txt = doc[i].get_text("text") or ""
         if INDEX_PAGE_RE.search(txt) or INDEX_PAGE_RE.search(_collapse_letterspacing(txt)):
+            return i + 1
+    for i in range(min(max_pages, doc.page_count)):
+        txt = doc[i].get_text("text") or ""
+        if INDEX_PAGE_FALLBACK_RE.search(txt):
             return i + 1
     return None
 
@@ -159,6 +170,36 @@ def _inline_row(line: str):
     return token, m.group(2).strip()
 
 
+# Date token glued to the front of an index row (#53): every Azalea discipline
+# used `MM.DD.YY` on its own line, but Citadel's Structural rows arrived as
+# `2026-05-27 S4.1 STATION PARKING…` — date and sheet row on ONE line, so
+# neither the bare nor the inline regex matched and the whole group vanished.
+_LEADING_DATE_RE = re.compile(
+    r"^(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\s+"
+)
+
+
+def _normalize_date_row(ln: str) -> list[str]:
+    """Expand a date-prefixed sheet row into clean line(s); else pass through.
+
+    Issuance lines like ``05.28.26 ISSUED FOR PERMIT`` must stay intact so the
+    existing date/issuance skip in `_parse_index_lines` still rejects them.
+    Date-prefixed inline rows are split into a bare token line + title line:
+    the date prefix marks a real index row, so the shallow-inline-token guard
+    in `_inline_row` (which would reject e.g. `S4.1`) must not apply here.
+    """
+    m = _LEADING_DATE_RE.match(ln)
+    if not m:
+        return [ln]
+    rest = ln[m.end() :]
+    if _LINE_SHEET_RE.match(rest):
+        return [rest]
+    im = _INLINE_SHEET_RE.match(rest)
+    if im:
+        return [im.group(1), im.group(2).strip()]
+    return [ln]
+
+
 def _parse_index_lines(lines: list[str]) -> list[dict]:
     """Walk lines, emit one entry per `SheetNum → Title` pair.
 
@@ -170,6 +211,7 @@ def _parse_index_lines(lines: list[str]) -> list[dict]:
     of the token-scrape noise (e.g. abbreviation codes on legend pages).
     Multi-line titles are accepted by greedy-extending to the next sheet line.
     """
+    lines = [out for ln in lines for out in _normalize_date_row(ln)]
     entries: list[dict] = []
     seen: set[str] = set()
     i = 0
@@ -341,6 +383,7 @@ def classify_index_scope(
     index_rows: list[dict],
     *,
     project_bookmark_prefixes: set[str] | None = None,
+    project_sheet_keys: set[str] | None = None,
 ) -> str:
     """Content-driven master/volume classification (ADR-0014).
 
@@ -399,6 +442,31 @@ def classify_index_scope(
         and outside_total >= 5 * max(own_sheets, 1)
     ):
         return "master_index"
+    # Sub-set master (#54): a sub-project volume ("Architectural - Shed")
+    # carries the master index for its whole sub-set, but at sub-set scale —
+    # own 7, outside S×4 + E×3 — far below the big-master thresholds above.
+    # Exact-key matching makes this safe at low counts: outside entries must
+    # name real sheets that physically exist in OTHER volumes of the project
+    # (legend/finish/schedule codes never do), across >= 2 disciplines, and
+    # the index must substantially cover its own volume's sheets.
+    if project_sheet_keys is not None and sheets:
+        own_sheet_keys = {normalize_sheet_number(s["sheet_number"]) for s in sheets}
+        own_exact = 0
+        outside_exact: dict[str, int] = {}
+        for row in index_rows:
+            key = normalize_sheet_number(row["sheet_number"])
+            m = _SHEET_PREFIX_RE.match(row["sheet_number"])
+            if key in own_sheet_keys:
+                own_exact += 1
+            elif key in project_sheet_keys and m:
+                prefix = m.group(1).upper()
+                outside_exact[prefix] = outside_exact.get(prefix, 0) + 1
+        if (
+            own_exact >= 0.5 * len(own_sheet_keys)
+            and len(outside_exact) >= 2
+            and sum(outside_exact.values()) >= 3
+        ):
+            return "master_index"
     return "volume_index"
 
 
@@ -407,6 +475,7 @@ def analyze_pdf(
     *,
     config: DrawingIndexConfig | None = None,
     project_bookmark_prefixes: set[str] | None = None,
+    project_sheet_keys: set[str] | None = None,
 ) -> dict:
     """Extract sheets, index entries, and cross-check samples from one drawing PDF."""
     path = Path(pdf_path)
@@ -436,7 +505,10 @@ def analyze_pdf(
                     page_of[key] = p
                     raw_rows_all.append(row)
             source = classify_index_scope(
-                sheets, raw_rows_all, project_bookmark_prefixes=project_bookmark_prefixes
+                sheets,
+                raw_rows_all,
+                project_bookmark_prefixes=project_bookmark_prefixes,
+                project_sheet_keys=project_sheet_keys,
             )
             # Reject non-drawing-index parses (finish schedules, equipment legends,
             # material codes, etc.) when classified as volume_index. A real

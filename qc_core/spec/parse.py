@@ -320,16 +320,26 @@ def _toc_page_density(doc, start_0: int) -> int:
     return count
 
 
-def detect_toc_range(doc) -> tuple[int, int]:
+def detect_toc_range(doc) -> tuple[int, int, bool]:
+    """Return ``(toc_start, toc_end, confirmed)`` as 0-based page indices.
+
+    ``confirmed`` is True only when a genuine TOC was found — via a TOC outline
+    bookmark or a ``TABLE OF CONTENTS`` heading page. It is False when the range
+    was fabricated by the bare-section-density fallback (issue #52): a manual
+    with no TOC at all otherwise gets its first body section pages crowned as a
+    phantom "TOC", inverting the TOC↔body diff into ~hundreds of false findings.
+    The caller skips the section-completeness check when ``confirmed`` is False.
+    """
     from_outline = _detect_toc_from_outline(doc)
     # Trust the outline only when its TOC page is actually dense with section
     # numbers; a sparse range usually means we latched onto the wrong bookmark,
     # so fall back to the text scan below and compare.
     if from_outline is not None and _toc_page_density(doc, from_outline[0]) >= 5:
-        return from_outline
+        return (*from_outline, True)
 
     n = len(doc)
     toc_start = None
+    heading_confirmed = False
 
     for i in range(min(n, 30)):
         text = doc[i].get_text()
@@ -349,6 +359,7 @@ def detect_toc_range(doc) -> tuple[int, int]:
             )
             if is_spec_toc:
                 toc_start = i
+                heading_confirmed = True
                 break
 
     if toc_start is None:
@@ -365,8 +376,10 @@ def detect_toc_range(doc) -> tuple[int, int]:
 
     if toc_start is None:
         if from_outline is not None:
-            return from_outline
-        return (0, min(9, n - 1))
+            # Outline failed the density gate above and no heading/text-scan
+            # range was found — a sparse outline alone does not confirm (#52).
+            return (*from_outline, False)
+        return (0, min(9, n - 1), False)
 
     toc_end = toc_start
     consecutive_low = 0
@@ -428,8 +441,12 @@ def detect_toc_range(doc) -> tuple[int, int]:
     if from_outline is not None and _toc_page_density(
         doc, from_outline[0]
     ) > _toc_page_density(doc, toc_start):
-        return from_outline
-    return (toc_start, toc_end)
+        return (*from_outline, heading_confirmed)
+    # Only a TABLE OF CONTENTS heading page confirms here: an outline that
+    # reaches this point already failed the density gate above, and the
+    # bare-section-density fallback alone does not confirm (issue #52).
+    confirmed = heading_confirmed
+    return (toc_start, toc_end, confirmed)
 
 
 def _running_header_lines(doc, toc_start: int, toc_end: int) -> set[str]:
@@ -595,6 +612,29 @@ def _page_running_header(nonempty: list[str]) -> Optional[tuple[str, int]]:
     return None
 
 
+def _title_above_running_header(nonempty: list[str]) -> str:
+    """Title for the sub-consultant ("by B&A") title-block layout (#58).
+
+    These sections carry no dashed ``SECTION NN NN NN - TITLE`` header our
+    regex matches; the number lives in the title-block page-number line
+    (``26 05 53 - 1``, captured as the running header) with the section title
+    in the ALL-CAPS line directly above it. Return that title, or "".
+    """
+    for i, line in enumerate(nonempty):
+        m = _RUNNING_HEADER_RE.match(line)
+        if not m:
+            continue
+        norm = normalize_section_num(m.group(1))
+        if not norm or not is_valid_csi_number(norm):
+            continue
+        if i > 0:
+            prev = nonempty[i - 1].strip()
+            if prev and prev == prev.upper() and re.search(r"[A-Za-z]", prev):
+                return prev
+        return ""
+    return ""
+
+
 def normalize_title_for_dup(title: str) -> str:
     """Aggressive title normalization for duplicate-name detection (#45):
     lowercase, treat hyphen/space as equivalent, strip punctuation. So
@@ -705,6 +745,29 @@ def extract_body_sections(doc, body_start: int) -> list[dict]:
             first_page.setdefault(norm, page_idx + 1)
             found_section_this_page = True
 
+        # Sub-consultant ("by B&A") title-block layout (#58): a genuine first
+        # page (running-header counter == 1) whose section header our regex
+        # never matched — the number lives only in the title-block page-number
+        # line. Bind that authoritative number to the ALL-CAPS title above it.
+        # Pages where a header DID match (incl. mis-numbered ones, #44) are left
+        # untouched, so the typo'd 26 20 00 / .13 discrepancies still surface to
+        # the reconciliation matrix for judgment rather than being silently
+        # rewritten here.
+        if (
+            not found_section_this_page
+            and header_section is not None
+            and header_counter == 1
+            and header_section not in first_page
+        ):
+            occurrences.append(
+                {
+                    "number": header_section,
+                    "title": _title_above_running_header(nonempty),
+                    "page": page_idx + 1,
+                }
+            )
+            first_page.setdefault(header_section, page_idx + 1)
+
     return _assign_occurrences(occurrences)
 
 
@@ -798,11 +861,81 @@ def extract_all_section_refs(
                             "from_label": from_label,
                             "referenced_number": norm,
                             "context_line": line_stripped[:150],
+                            "link_text": extract_ref_link_text(
+                                line_stripped[m.end():]
+                            ),
                             "page": page_num,
                         }
                     )
 
     return refs
+
+
+# Link text trailing a cross-reference number: an optional separator then a
+# title-cased phrase ("Section 05 51 13, Metal Stairs" -> "Metal Stairs").
+_LINK_TEXT_RE = re.compile(
+    r"""^\s*[-–—,:]?\s*["']?\s*([A-Z][A-Za-z0-9&/'()\- ]{2,60})"""
+)
+
+
+def extract_ref_link_text(after: str) -> Optional[str]:
+    """Title text adjacent to a cross-reference (#59), or None.
+
+    Truncates at sentence punctuation and trims dangling connectives so prose
+    continuations ("Section 09 96 00 for surface preparation and...") don't
+    pollute the captured title.
+    """
+    m = _LINK_TEXT_RE.match(after)
+    if not m:
+        return None
+    text = re.split(r"[.;:\"]", m.group(1))[0]
+    text = re.sub(r"\s+", " ", text).strip(" -–—,")
+    text = re.sub(r"\s+(and|or|for|the|a|an|of|to|in|as)$", "", text, flags=re.IGNORECASE)
+    if len(text) < 3 or not re.search(r"[A-Za-z]{3}", text):
+        return None
+    return text
+
+
+# Unfinished MasterSpec boilerplate (#61). An angle-bracket editor placeholder
+# (`<Insert thickness>`) is a high-precision "section is incomplete" signal. A
+# choose-one option bracket (`[jurisdiction]`) is only flagged when it shares a
+# line with an `<Insert ...>` — bare brackets also wrap legitimate unit
+# conversions (`[0.0187 inch (0.5 mm)]`), which must not be flagged.
+_INSERT_PLACEHOLDER_RE = re.compile(r"<\s*Insert\b[^>]*>", re.IGNORECASE)
+_OPTION_BRACKET_RE = re.compile(r"\[[^\[\]]{1,80}\]")
+
+
+def extract_placeholders(doc, body_start: int) -> list[dict]:
+    """Scan body pages for incomplete-placeholder / unresolved-option residue.
+
+    Returns ``[{"page", "kind", "token"}]`` (1-based page) in reading order.
+    ``token`` is the on-page text used to anchor the callout. Option brackets
+    are emitted only on lines that also carry an ``<Insert ...>`` placeholder.
+    """
+    out: list[dict] = []
+    n = len(doc)
+    for page_idx in range(body_start, n):
+        page = page_idx + 1
+        for line in doc[page_idx].get_text().split("\n"):
+            inserts = _INSERT_PLACEHOLDER_RE.findall(line)
+            for tok in inserts:
+                out.append(
+                    {
+                        "page": page,
+                        "kind": "incomplete_placeholder",
+                        "token": re.sub(r"\s+", " ", tok).strip(),
+                    }
+                )
+            if inserts:
+                for m in _OPTION_BRACKET_RE.finditer(line):
+                    out.append(
+                        {
+                            "page": page,
+                            "kind": "unresolved_option_bracket",
+                            "token": re.sub(r"\s+", " ", m.group(0)).strip(),
+                        }
+                    )
+    return out
 
 
 def titles_similar(t1: str, t2: str) -> bool:
@@ -823,6 +956,29 @@ def titles_similar(t1: str, t2: str) -> bool:
     if not w1 or not w2:
         return True
     return len(w1 & w2) / len(w1 | w2) >= 0.65
+
+
+def section_number_near_match(a: str, b: str) -> Optional[str]:
+    """Classify two canonical CSI numbers as a near-variant pair (#60).
+
+    'suffix'     — one is the other plus a .NN child suffix
+                   (23 05 48 vs 23 05 48.13)
+    'digit_typo' — same digit count, exactly one digit differs
+                   (26 22 00 vs 26 20 00)
+    """
+    if a == b:
+        return None
+    base_a, _, suf_a = a.partition(".")
+    base_b, _, suf_b = b.partition(".")
+    if base_a == base_b:
+        # same base, one bare + one suffixed -> suffix pair; two different
+        # suffixes are legitimately distinct sibling sections.
+        return "suffix" if bool(suf_a) != bool(suf_b) else None
+    da = re.sub(r"\D", "", a)
+    db = re.sub(r"\D", "", b)
+    if len(da) == len(db) and sum(x != y for x, y in zip(da, db)) == 1:
+        return "digit_typo"
+    return None
 
 
 def find_close_section_match(ref_num: str, all_known: set[str]) -> Optional[str]:
@@ -856,8 +1012,9 @@ def analyze_pdf(
     if toc_start is not None and toc_end is not None:
         toc_s = max(0, toc_start - 1)
         toc_e = min(n - 1, toc_end - 1)
+        toc_confirmed = True  # caller-specified range is authoritative
     else:
-        toc_s, toc_e = detect_toc_range(doc)
+        toc_s, toc_e, toc_confirmed = detect_toc_range(doc)
         auto_detected = True
 
     body_start = toc_e + 1
@@ -866,6 +1023,7 @@ def analyze_pdf(
     embedded_reports = detect_embedded_reports(doc)
     page_label_index = _build_page_label_index(doc)
     related_refs = extract_all_section_refs(doc, body_start, body_secs, page_label_index)
+    placeholders = extract_placeholders(doc, body_start)
 
     likely_scanned = False
     scan_warning = None
@@ -939,6 +1097,7 @@ def analyze_pdf(
             "toc_range": {"start": toc_s + 1, "end": toc_e + 1},
             "body_start_page": body_start + 1,
             "auto_detected_toc": auto_detected,
+            "toc_confirmed": toc_confirmed,
             "toc_section_count": len(toc_nums),
             "body_section_count": len(body_nums),
             "likely_scanned": likely_scanned,
@@ -948,6 +1107,7 @@ def analyze_pdf(
         "body_sections": sorted(body_secs, key=lambda x: x["number"]),
         "embedded_reports": embedded_reports,
         "related_refs": related_refs,
+        "placeholders": placeholders,
         "toc_not_in_body": sorted(toc_not_in_body, key=lambda x: x["number"]),
         "toc_by_consultant": sorted(toc_by_consultant, key=lambda x: x["number"]),
         "body_not_in_toc": body_not_in_toc,

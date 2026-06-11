@@ -68,11 +68,16 @@ def build_manifest(
     """
     conn.row_factory = sqlite3.Row
     kind_list = list(kinds) if kinds is not None else None
+    # Only kinds with an emit vocabulary, and only findings that have cleared
+    # judgment (ADR-0026): evidence rows are pending and never reach the PDF.
+    emittable = ", ".join("?" for _ in _SUBJECT_BY_KIND)
     query = (
         "SELECT * FROM findings "
-        "WHERE drawing_volume_id = ? AND expected_action = 'emit_markup'"
+        "WHERE drawing_volume_id = ? AND expected_action = 'emit_markup' "
+        "AND status IN ('candidate', 'accepted') "
+        f"AND kind IN ({emittable})"
     )
-    params: list = [volume_id]
+    params: list = [volume_id, *(_SUBJECT_BY_KIND.keys())]
     if kind_list:
         placeholders = ", ".join("?" for _ in kind_list)
         query += f" AND kind IN ({placeholders})"

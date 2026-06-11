@@ -6,6 +6,7 @@ findings computed against project-wide unions, not per-volume slices.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from qc_core.spec.parse import (
     is_admin,
     is_by_consultant,
     normalize_title_for_dup,
+    section_number_near_match,
     titles_similar,
 )
 
@@ -83,17 +85,19 @@ def index_spec_pdf(
 
     meta = result["meta"]
     toc_range = meta["toc_range"]
+    has_full_toc = 1 if meta.get("toc_confirmed", True) else 0
 
     if existing:
         volume_id = existing["id"]
         conn.execute("DELETE FROM spec_related_refs WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM spec_sections WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM embedded_reports WHERE volume_id = ?", (volume_id,))
+        conn.execute("DELETE FROM spec_placeholders WHERE volume_id = ?", (volume_id,))
         conn.execute(
             """
             UPDATE spec_volumes
             SET pdf_mtime = ?, page_count = ?, toc_start = ?, toc_end = ?,
-                body_start = ?, indexed_at = datetime('now')
+                body_start = ?, has_full_toc = ?, indexed_at = datetime('now')
             WHERE id = ?
             """,
             (
@@ -102,6 +106,7 @@ def index_spec_pdf(
                 toc_range["start"],
                 toc_range["end"],
                 meta["body_start_page"],
+                has_full_toc,
                 volume_id,
             ),
         )
@@ -109,8 +114,9 @@ def index_spec_pdf(
         cur = conn.execute(
             """
             INSERT INTO spec_volumes (
-                pdf_path, pdf_mtime, page_count, toc_start, toc_end, body_start
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                pdf_path, pdf_mtime, page_count, toc_start, toc_end, body_start,
+                has_full_toc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(path),
@@ -119,6 +125,7 @@ def index_spec_pdf(
                 toc_range["start"],
                 toc_range["end"],
                 meta["body_start_page"],
+                has_full_toc,
             ),
         )
         volume_id = cur.lastrowid
@@ -147,13 +154,22 @@ def index_spec_pdf(
             (volume_id, rep["number"], rep.get("title"), rep.get("page")),
         )
 
+    for ph in result.get("placeholders", []):
+        conn.execute(
+            """
+            INSERT INTO spec_placeholders (volume_id, page, kind, token)
+            VALUES (?, ?, ?, ?)
+            """,
+            (volume_id, ph["page"], ph["kind"], ph["token"]),
+        )
+
     for ref in result["related_refs"]:
         conn.execute(
             """
             INSERT INTO spec_related_refs (
                 volume_id, from_section, from_label, referenced_number,
-                context_line, page
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                context_line, link_text, page
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 volume_id,
@@ -161,6 +177,7 @@ def index_spec_pdf(
                 ref.get("from_label"),
                 ref["referenced_number"],
                 ref.get("context_line"),
+                ref.get("link_text"),
                 ref["page"],
             ),
         )
@@ -333,83 +350,127 @@ def compute_project_findings(
     body_nums = {n for n in body_by_num if not is_admin(n)}
     all_known = set(toc_by_num) | set(body_by_num)
 
-    # Mis-numbered sections (#44): a body header whose title matches a TOC entry
-    # but whose number differs is a single mis-numbering defect, not a pair of
-    # orphans (toc_not_in_body + body_not_in_toc). Detect by normalized-title
-    # match and suppress both orphans in favor of one section_number_mismatch.
-    mismatch_toc_nums, mismatch_body_nums = _detect_section_number_mismatches(
-        conn, toc_by_num, body_by_num, toc_nums, body_nums
+    # Section-completeness check (toc_not_in_body / body_not_in_toc) is only
+    # applicable when the set actually has a specification TOC. On a TOC-less
+    # manual the parser fabricates a phantom TOC from the first body pages and
+    # the diff inverts into hundreds of false findings (issue #52). When no
+    # volume carries a confirmed TOC, skip both completeness kinds and record a
+    # single info note. broken_related_ref and duplicate checks are unaffected.
+    project_has_toc = (
+        conn.execute(
+            "SELECT 1 FROM spec_volumes WHERE has_full_toc = 1 LIMIT 1"
+        ).fetchone()
+        is not None
     )
 
-    # Embedded non-CSI reports confirmed present via the PDF outline (#43): keyed
-    # by number -> a representative (volume_id, page). Such a report is listed in
-    # the TOC but has no CSI body header, so it would otherwise be a false
-    # toc_not_in_body. When the outline confirms it is bound in, downgrade.
-    embedded_present: dict[str, sqlite3.Row] = {}
-    for r in conn.execute(
-        "SELECT volume_id, number, title, page FROM embedded_reports"
-    ).fetchall():
-        embedded_present.setdefault(r["number"], r)
+    body_divs = {_division_of(n) for n in body_nums}
 
-    # toc_not_in_body (split out toc_by_consultant as info_only — not emitted)
-    for num in sorted(toc_nums - body_nums - mismatch_toc_nums):
-        row = toc_by_num[num]
-        title = row["title"] or ""
-        if is_by_consultant(title):
-            continue
-        if num in embedded_present:
-            rep = embedded_present[num]
+    if project_has_toc:
+        # Mis-numbered sections (#44): a body header whose title matches a TOC
+        # entry but whose number differs is a single mis-numbering defect, not a
+        # pair of orphans (toc_not_in_body + body_not_in_toc). Detect by
+        # normalized-title match and suppress both orphans in favor of one
+        # section_number_mismatch.
+        mismatch_toc_nums, mismatch_body_nums = _detect_section_number_mismatches(
+            conn, toc_by_num, body_by_num, toc_nums, body_nums
+        )
+
+        # Embedded non-CSI reports confirmed present via the PDF outline (#43):
+        # keyed by number -> a representative (volume_id, page). Such a report is
+        # listed in the TOC but has no CSI body header, so it would otherwise be
+        # a false toc_not_in_body. When the outline confirms it is bound in,
+        # downgrade.
+        embedded_present: dict[str, sqlite3.Row] = {}
+        for r in conn.execute(
+            "SELECT volume_id, number, title, page FROM embedded_reports"
+        ).fetchall():
+            embedded_present.setdefault(r["number"], r)
+
+        # toc_not_in_body (split out toc_by_consultant as info_only — not emitted)
+        for num in sorted(toc_nums - body_nums - mismatch_toc_nums):
+            row = toc_by_num[num]
+            title = row["title"] or ""
+            if is_by_consultant(title):
+                continue
+            if num in embedded_present:
+                rep = embedded_present[num]
+                conn.execute(
+                    """
+                    INSERT INTO findings (
+                        volume_id, kind, expected_action, severity,
+                        section, title, toc_page, body_page, notes
+                    ) VALUES (?, 'embedded_report_present', 'info_only', 'low',
+                              ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rep["volume_id"],
+                        num,
+                        title,
+                        row["toc_page"],
+                        rep["page"],
+                        "Embedded non-CSI document (e.g. a bound-in report) — "
+                        "listed in the TOC and confirmed present in the set via "
+                        "the PDF outline; has no CSI section body by design, so "
+                        "not a toc_not_in_body defect.",
+                    ),
+                )
+                continue
             conn.execute(
                 """
                 INSERT INTO findings (
-                    volume_id, kind, expected_action, severity,
-                    section, title, toc_page, body_page, notes
-                ) VALUES (?, 'embedded_report_present', 'info_only', 'low',
-                          ?, ?, ?, ?, ?)
+                    volume_id, kind, expected_action, severity, section, title, toc_page
+                ) VALUES (?, 'toc_not_in_body', 'emit_markup', 'medium', ?, ?, ?)
                 """,
-                (
-                    rep["volume_id"],
-                    num,
-                    title,
-                    row["toc_page"],
-                    rep["page"],
-                    "Embedded non-CSI document (e.g. a bound-in report) — listed "
-                    "in the TOC and confirmed present in the set via the PDF "
-                    "outline; has no CSI section body by design, so not a "
-                    "toc_not_in_body defect.",
-                ),
+                (row["representative_volume_id"], num, title, row["toc_page"]),
             )
-            continue
-        conn.execute(
-            """
-            INSERT INTO findings (
-                volume_id, kind, expected_action, severity, section, title, toc_page
-            ) VALUES (?, 'toc_not_in_body', 'emit_markup', 'medium', ?, ?, ?)
-            """,
-            (row["representative_volume_id"], num, title, row["toc_page"]),
-        )
 
-    # body_not_in_toc
-    body_divs = {_division_of(n) for n in body_nums}
-    for num in sorted(body_nums - toc_nums - mismatch_body_nums):
-        row = body_by_num[num]
+        # body_not_in_toc
+        for num in sorted(body_nums - toc_nums - mismatch_body_nums):
+            row = body_by_num[num]
+            conn.execute(
+                """
+                INSERT INTO findings (
+                    volume_id, kind, expected_action, severity, section, title, body_page
+                ) VALUES (?, 'body_not_in_toc', 'emit_markup', 'high', ?, ?, ?)
+                """,
+                (row["volume_id"], num, row["title"], row["page"]),
+            )
+    else:
+        # The NULL-volume_id case escapes the per-volume findings cleanup, so a
+        # re-index would otherwise stack a duplicate row each run.
+        conn.execute("DELETE FROM findings WHERE kind = 'spec_toc_absent'")
+        rep = conn.execute(
+            "SELECT id FROM spec_volumes ORDER BY id LIMIT 1"
+        ).fetchone()
         conn.execute(
             """
             INSERT INTO findings (
-                volume_id, kind, expected_action, severity, section, title, body_page
-            ) VALUES (?, 'body_not_in_toc', 'emit_markup', 'high', ?, ?, ?)
+                volume_id, kind, expected_action, severity, notes
+            ) VALUES (?, 'spec_toc_absent', 'info_only', 'low', ?)
             """,
-            (row["volume_id"], num, row["title"], row["page"]),
+            (
+                rep["id"] if rep else None,
+                "No specification TOC found — section-completeness check "
+                "(toc_not_in_body / body_not_in_toc) skipped. Related-reference "
+                "and duplicate-section checks still ran.",
+            ),
         )
 
     # Broken / typo refs: target not in union(all_known) and not admin
     refs = conn.execute(
         """
         SELECT volume_id, from_section, from_label, referenced_number,
-               context_line, page
+               context_line, link_text, page
         FROM spec_related_refs
         """
     ).fetchall()
+
+    # Title lookup for the IR classifier (#59): normalized title -> numbers.
+    titles_by_norm: dict[str, set[str]] = {}
+    for num, row in list(toc_by_num.items()) + list(body_by_num.items()):
+        t = normalize_title_for_dup(row["title"] or "")
+        if t:
+            titles_by_norm.setdefault(t, set()).add(num)
 
     seen: set[tuple] = set()
     broken: list[sqlite3.Row] = []
@@ -444,6 +505,13 @@ def compute_project_findings(
             (rep_vol, div, comment),
         )
 
+    broken.sort(key=lambda r: (r["volume_id"], r["referenced_number"], r["page"]))
+    broken_count_by_target: dict[tuple, int] = {}
+    for r in broken:
+        k = (r["volume_id"], r["referenced_number"])
+        broken_count_by_target[k] = broken_count_by_target.get(k, 0) + 1
+    emitted_targets: set[tuple] = set()
+
     for r in broken:
         div = _division_of(r["referenced_number"])
         target = r["referenced_number"]
@@ -467,24 +535,173 @@ def compute_project_findings(
                 ),
             )
         else:
+            # #59: volume-wide dedup — repeat refs to the same broken target
+            # are recorded info_only; the earliest occurrence carries the
+            # markup, tagged 'typical' so the comment reads accordingly.
+            dedup_key = (r["volume_id"], target)
+            is_first = dedup_key not in emitted_targets
+            emitted_targets.add(dedup_key)
+
+            ref_cls, suggestion = _classify_broken_ref(
+                target, r["link_text"], all_known, titles_by_norm
+            )
+            tags = [ref_cls] if ref_cls else []
+            if is_first and broken_count_by_target.get(dedup_key, 0) > 1:
+                tags.append("typical")
             conn.execute(
                 """
                 INSERT INTO findings (
                     volume_id, kind, expected_action, severity,
-                    from_section, from_label, to_section, source_page, context
-                ) VALUES (?, 'broken_related_ref', 'emit_markup', 'medium', ?, ?, ?, ?, ?)
+                    from_section, from_label, to_section, source_page, context,
+                    probable_match, ref_class, notes
+                ) VALUES (?, 'broken_related_ref', ?, 'medium', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r["volume_id"],
+                    "emit_markup" if is_first else "info_only",
                     r["from_section"],
                     r["from_label"],
-                    r["referenced_number"],
+                    target,
                     r["page"],
                     r["context_line"],
+                    suggestion,
+                    ",".join(tags) or None,
+                    None
+                    if is_first
+                    else f"Deduplicated: same broken target {target} already "
+                    f"flagged earlier in this volume (kept first occurrence).",
                 ),
             )
 
     _detect_duplicate_section_numbers(conn)
+    _detect_incomplete_placeholders(conn)
+    _reconcile_and_gate(conn)
+
+
+def _reconcile_and_gate(conn: sqlite3.Connection) -> None:
+    """ADR-0026 §2 spec instantiation: persist the reconciliation matrix, run
+    the fail-loud invariants, and hold completeness conclusions on untrusted
+    divisions at status='evidence' (pending judgment) rather than concluding
+    them as Candidates."""
+    from qc_core.spec import matrix as spec_matrix
+
+    spec_matrix.build_matrix(conn)
+    spec_matrix.evaluate_invariants(conn)
+
+    untrusted = spec_matrix.tripped_division_scopes(conn)
+    if not untrusted:
+        return
+    rows = conn.execute(
+        "SELECT id, section FROM findings "
+        "WHERE kind IN ('body_not_in_toc', 'toc_not_in_body') AND section IS NOT NULL"
+    ).fetchall()
+    for r in rows:
+        if _division_of(r["section"]) in untrusted:
+            conn.execute(
+                "UPDATE findings SET status = 'evidence', evidence_key = ? WHERE id = ?",
+                (r["section"], r["id"]),
+            )
+
+
+def _detect_incomplete_placeholders(conn: sqlite3.Connection) -> None:
+    """Emit one callout per (volume, page, kind) for unfinished MasterSpec
+    boilerplate (#61). A page repeating the same signal gets a "(typical)"
+    callout; the first token anchors it. incomplete_placeholder (`<Insert …>`)
+    is high precision; unresolved_option_bracket is already gated at parse time
+    on same-line co-occurrence with an `<Insert …>`."""
+    rows = conn.execute(
+        "SELECT volume_id, page, kind, token FROM spec_placeholders "
+        "ORDER BY volume_id, page, kind, id"
+    ).fetchall()
+
+    grouped: dict[tuple[int, int, str], list[str]] = {}
+    for r in rows:
+        grouped.setdefault((r["volume_id"], r["page"], r["kind"]), []).append(
+            r["token"]
+        )
+
+    for (volume_id, page, kind), tokens in grouped.items():
+        typical = len(tokens) > 1
+        if kind == "incomplete_placeholder":
+            comment = "Incomplete (typical)" if typical else "Incomplete"
+        else:
+            comment = "Delete, typical" if typical else "Delete"
+        notes = (
+            f"{len(tokens)} occurrence(s) on p.{page}; e.g. {tokens[0]}"
+            if typical
+            else tokens[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO findings (
+                volume_id, kind, expected_action, severity,
+                body_page, client_comment, context, notes
+            ) VALUES (?, ?, 'emit_markup', 'medium', ?, ?, ?, ?)
+            """,
+            (volume_id, kind, page, comment, tokens[0], notes),
+        )
+
+
+def _digit_edit_le1(a: str, b: str) -> bool:
+    """Digit strings within one substitution, insertion, or deletion."""
+    if a == b:
+        return True
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    if abs(len(a) - len(b)) != 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = 0
+    skipped = False
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        elif skipped:
+            return False
+        else:
+            skipped = True
+            j += 1
+    return True
+
+
+def _classify_broken_ref(
+    target: str,
+    link_text: str | None,
+    all_known: set[str],
+    titles_by_norm: dict[str, set[str]],
+) -> tuple[str | None, str | None]:
+    """Classify a broken cross-reference target (#59).
+
+    Returns (ref_class, suggested_number):
+      'ir'         — the captured link text matches exactly one known section
+                     title in the target's division ("Metal Stairs" exists,
+                     just under 05 51 00 not 05 51 13)
+      'suffix'     — target is absent but exactly one `target.NN` child exists
+      'digit_typo' — exactly one known section sits within digit edit
+                     distance 1 (07 27 260 -> 07 27 26; 20 05 00 -> 22 05 00)
+      (None, None) — plain CNL.
+    """
+    if link_text:
+        t = normalize_title_for_dup(link_text)
+        candidates = {
+            n
+            for n in titles_by_norm.get(t, set())
+            if n.split()[0] == target.split()[0]
+        }
+        if len(candidates) == 1:
+            return "ir", candidates.pop()
+    children = sorted(k for k in all_known if k.startswith(target + "."))
+    if len(children) == 1:
+        return "suffix", children[0]
+    td = re.sub(r"\D", "", target)
+    near = sorted(
+        k for k in all_known if _digit_edit_le1(td, re.sub(r"\D", "", k))
+    )
+    if len(near) == 1:
+        return "digit_typo", near[0]
+    return None, None
 
 
 def _detect_section_number_mismatches(
@@ -504,9 +721,44 @@ def _detect_section_number_mismatches(
 
     Only unambiguous 1:1 title matches are paired — if a title resolves to more
     than one orphan on either side, both are left as plain orphans.
+
+    A second pass (#60) pairs remaining orphans whose *numbers* are near
+    variants — a `.NN` suffix child or a single-digit typo — provided their
+    titles are compatible. Those carry a match basis in `context` ('suffix' /
+    'digit_typo') so emit can produce a two-sided AVW callout instead of the
+    one-sided "should be" correction.
     """
     toc_only = toc_nums - body_nums
     body_only = body_nums - toc_nums
+
+    matched_toc: set[str] = set()
+    matched_body: set[str] = set()
+
+    def _insert(toc_num: str, body_num: str, basis: str, notes: str) -> None:
+        matched_toc.add(toc_num)
+        matched_body.add(body_num)
+        trow = toc_by_num[toc_num]
+        brow = body_by_num[body_num]
+        title = (trow["title"] or brow["title"] or "").strip()
+        conn.execute(
+            """
+            INSERT INTO findings (
+                volume_id, kind, expected_action, severity,
+                section, title, body_page, toc_page, probable_match, context, notes
+            ) VALUES (?, 'section_number_mismatch', 'emit_markup', 'high',
+                      ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                brow["volume_id"],
+                body_num,
+                title,
+                brow["page"],
+                trow["toc_page"],
+                toc_num,
+                basis,
+                notes,
+            ),
+        )
 
     body_by_title: dict[str, list[str]] = {}
     for num in body_only:
@@ -514,8 +766,6 @@ def _detect_section_number_mismatches(
         if t:
             body_by_title.setdefault(t, []).append(num)
 
-    matched_toc: set[str] = set()
-    matched_body: set[str] = set()
     for toc_num in sorted(toc_only):
         t = normalize_title_for_dup(toc_by_num[toc_num]["title"] or "")
         if not t:
@@ -526,35 +776,65 @@ def _detect_section_number_mismatches(
         body_num = candidates[0]
         if body_num in matched_body:
             continue
-        matched_toc.add(toc_num)
-        matched_body.add(body_num)
-
         trow = toc_by_num[toc_num]
         brow = body_by_num[body_num]
         title = (trow["title"] or brow["title"] or "").strip()
-        notes = (
-            f'Section title "{title}" is numbered {body_num} in the body '
-            f'(p.{brow["page"]}) but {toc_num} in the TOC (p.{trow["toc_page"]}). '
-            f"Body section number is likely wrong; should be {toc_num}."
+        # Even on a title match, a near-variant number (suffix/digit typo)
+        # means neither side is provably right — record that basis so emit
+        # produces the two-sided AVW callout instead of a correction.
+        basis = section_number_near_match(toc_num, body_num) or "title"
+        if basis == "title":
+            notes = (
+                f'Section title "{title}" is numbered {body_num} in the body '
+                f'(p.{brow["page"]}) but {toc_num} in the TOC (p.{trow["toc_page"]}). '
+                f"Body section number is likely wrong; should be {toc_num}."
+            )
+        else:
+            notes = (
+                f"TOC lists {toc_num} (p.{trow['toc_page']}) while the body carries "
+                f"{body_num} (p.{brow['page']}) — a near-variant number under the "
+                f"same title. Which side is correct needs reviewer confirmation "
+                f"(AVW both)."
+            )
+        _insert(toc_num, body_num, basis, notes)
+
+    # Pass 2 (#60): number-proximity pairs among the orphans the title pass
+    # left behind. Requires an unambiguous 1:1 near-match on both sides and
+    # compatible titles (titles_similar accepts a blank side).
+    near_by_toc: dict[str, list[tuple[str, str]]] = {}
+    near_by_body: dict[str, int] = {}
+    for toc_num in sorted(toc_only - matched_toc):
+        for body_num in sorted(body_only - matched_body):
+            basis = section_number_near_match(toc_num, body_num)
+            if basis is None:
+                continue
+            if not titles_similar(
+                toc_by_num[toc_num]["title"] or "", body_by_num[body_num]["title"] or ""
+            ):
+                continue
+            near_by_toc.setdefault(toc_num, []).append((body_num, basis))
+            near_by_body[body_num] = near_by_body.get(body_num, 0) + 1
+
+    for toc_num, pairs in sorted(near_by_toc.items()):
+        if len(pairs) != 1:
+            continue
+        body_num, basis = pairs[0]
+        if near_by_body[body_num] != 1 or body_num in matched_body:
+            continue
+        trow = toc_by_num[toc_num]
+        brow = body_by_num[body_num]
+        what = (
+            "a .NN suffix variant" if basis == "suffix" else "a single-digit variant"
         )
-        conn.execute(
-            """
-            INSERT INTO findings (
-                volume_id, kind, expected_action, severity,
-                section, title, body_page, toc_page, probable_match, notes
-            ) VALUES (?, 'section_number_mismatch', 'emit_markup', 'high',
-                      ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                brow["volume_id"],
-                body_num,
-                title,
-                brow["page"],
-                trow["toc_page"],
-                toc_num,
-                notes,
-            ),
+        _insert(
+            toc_num,
+            body_num,
+            basis,
+            f"TOC lists {toc_num} (p.{trow['toc_page']}) while the body carries "
+            f"{body_num} (p.{brow['page']}) — {what} of the same section. "
+            f"Which side is correct needs reviewer confirmation (AVW both).",
         )
+
     return matched_toc, matched_body
 
 

@@ -310,6 +310,13 @@ def _format_finding(row: dict) -> str:
             f"{row.get('probable_match')} — {row.get('title') or ''} "
             f"(body p.{row.get('body_page')}, TOC p.{row.get('toc_page')})"
         ).rstrip()
+    if kind == "spec_toc_absent":
+        return f"  [info] {row.get('notes') or 'No specification TOC found.'}"
+    if kind in ("incomplete_placeholder", "unresolved_option_bracket"):
+        return (
+            f"  [{row.get('severity', 'medium')}] p.{row.get('body_page')} "
+            f"\"{row.get('client_comment') or ''}\" — {row.get('context') or ''}"
+        ).rstrip()
     if kind in ("duplicate_section_number", "duplicate_section_number_and_name"):
         return (
             f"  [{row.get('severity', 'medium')}] {row['section']} "
@@ -318,7 +325,67 @@ def _format_finding(row: dict) -> str:
     return f"  {kind}: {row}"
 
 
+def _spec_matrix_report(conn) -> int:
+    """Print the spec judgment-node worklist as JSON (ADR-0026): tripped
+    invariants, pending Evidence findings, and disputed matrix rows."""
+    import json as _json
+
+    from qc_core.spec import matrix as spec_matrix
+
+    report = {
+        "check": spec_matrix.CHECK_NAME,
+        "invariants": spec_matrix.all_invariants(conn),
+        "pending_evidence": spec_matrix.pending_evidence(conn),
+        "disputed_rows": spec_matrix.disputed_rows(conn),
+    }
+    print(_json.dumps(report, indent=2))
+    return 0
+
+
+def _spec_apply_judgments(conn, path: str) -> int:
+    import json as _json
+
+    from qc_core.spec import matrix as spec_matrix
+
+    payload = _json.loads(Path(path).read_text(encoding="utf-8"))
+    applied = spec_matrix.apply_judgments(conn, payload)
+    conn.commit()
+    print(
+        f"judgments applied: {applied['promoted']} promoted, "
+        f"{applied['dismissed']} dismissed, {applied['reclassified']} reclassified, "
+        f"{applied['invariants']} invariant resolutions"
+    )
+    return 0
+
+
+def _spec_trust_gate(conn) -> list[str]:
+    """ADR-0026 §6a teeth: reasons emit must not proceed, empty when clean."""
+    from qc_core.spec import matrix as spec_matrix
+
+    problems = []
+    for inv in spec_matrix.all_invariants(conn):
+        if inv["status"] == "tripped":
+            problems.append(
+                f"tripped invariant [{inv['id']}] {inv['invariant']} scope={inv['scope']}"
+            )
+    pending = spec_matrix.pending_evidence(conn)
+    if pending:
+        problems.append(f"{len(pending)} finding(s) at status=evidence pending judgment")
+    return problems
+
+
 def _emit(conn, args) -> int:
+    problems = _spec_trust_gate(conn)
+    if problems:
+        print("EMIT BLOCKED — output is untrusted until resolved (ADR-0026):")
+        for p in problems:
+            print(f"  - {p}")
+        print(
+            "Run --mode=matrix for the judgment worklist, then "
+            "--apply-judgments <decisions.json>, or record a Reviewer override."
+        )
+        return 2
+
     reviewer = _resolve_reviewer(args)
     kinds = args.kind or None
 
@@ -361,9 +428,21 @@ def spec_check_main(argv: list[str] | None = None) -> int:
     parser.add_argument("project_folder", help="Folder containing spec PDF(s) and qc.sqlite")
     parser.add_argument(
         "--mode",
-        choices=["preview", "emit"],
+        choices=["preview", "emit", "matrix"],
         default="preview",
-        help="preview: print findings; emit: write annotated PDF via PyMuPDF (ADR-0012)",
+        help=(
+            "preview: print findings; emit: write annotated PDF via PyMuPDF "
+            "(ADR-0012); matrix: print the judgment-node worklist as JSON "
+            "(tripped invariants, pending evidence, disputed matrix rows; ADR-0026)"
+        ),
+    )
+    parser.add_argument(
+        "--apply-judgments",
+        metavar="DECISIONS_JSON",
+        help=(
+            "Apply a judgment node's decisions file (promote/dismiss/reclassify "
+            "evidence; resolve/override invariants) per ADR-0026, then exit"
+        ),
     )
     parser.add_argument(
         "--reviewer",
@@ -395,9 +474,14 @@ def spec_check_main(argv: list[str] | None = None) -> int:
 
     conn = queries.open_project_db(args.project_folder)
     try:
+        if args.apply_judgments:
+            return _spec_apply_judgments(conn, args.apply_judgments)
+        if args.mode == "matrix":
+            return _spec_matrix_report(conn)
         if args.mode == "emit":
             return _emit(conn, args)
         findings = queries.all_findings(conn)
+        gate_problems = _spec_trust_gate(conn)
     finally:
         conn.close()
 
@@ -407,6 +491,12 @@ def spec_check_main(argv: list[str] | None = None) -> int:
 
     print(f"=== spec-check preview ({Path(args.project_folder).name}) ===")
     print(f"Total findings: {len(findings)}\n")
+
+    if gate_problems:
+        print("!! UNTRUSTED SCOPE (ADR-0026) — emit is blocked until resolved:")
+        for p in gate_problems:
+            print(f"  - {p}")
+        print("  Run --mode=matrix for the judgment worklist.\n")
 
     for kind in SPEC_FINDING_KINDS:
         rows = by_kind.get(kind, [])
@@ -423,7 +513,69 @@ def spec_check_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _drawing_matrix_report(conn) -> int:
+    """Print the judgment-node worklist as JSON (ADR-0026): tripped
+    invariants, pending Evidence findings, and disputed matrix rows."""
+    import json as _json
+
+    from qc_core.drawing import matrix as drawing_matrix
+
+    report = {
+        "check": drawing_matrix.CHECK_NAME,
+        "invariants": drawing_matrix.all_invariants(conn),
+        "pending_evidence": drawing_matrix.pending_evidence(conn),
+        "disputed_rows": drawing_matrix.disputed_rows(conn),
+    }
+    print(_json.dumps(report, indent=2))
+    return 0
+
+
+def _drawing_apply_judgments(conn, path: str) -> int:
+    import json as _json
+
+    from qc_core.drawing import matrix as drawing_matrix
+
+    payload = _json.loads(Path(path).read_text(encoding="utf-8"))
+    applied = drawing_matrix.apply_judgments(conn, payload)
+    conn.commit()
+    print(
+        f"judgments applied: {applied['promoted']} promoted, "
+        f"{applied['dismissed']} dismissed, {applied['reclassified']} reclassified, "
+        f"{applied['invariants']} invariant resolutions"
+    )
+    return 0
+
+
+def _drawing_trust_gate(conn) -> list[str]:
+    """ADR-0026 §6a teeth: reasons emit must not proceed, empty when clean."""
+    from qc_core.drawing import matrix as drawing_matrix
+
+    problems = []
+    tripped = [
+        inv for inv in drawing_matrix.all_invariants(conn) if inv["status"] == "tripped"
+    ]
+    for inv in tripped:
+        problems.append(
+            f"tripped invariant [{inv['id']}] {inv['invariant']} scope={inv['scope']}"
+        )
+    pending = drawing_matrix.pending_evidence(conn)
+    if pending:
+        problems.append(f"{len(pending)} finding(s) at status=evidence pending judgment")
+    return problems
+
+
 def _drawing_emit(conn, args) -> int:
+    problems = _drawing_trust_gate(conn)
+    if problems:
+        print("EMIT BLOCKED — output is untrusted until resolved (ADR-0026):")
+        for p in problems:
+            print(f"  - {p}")
+        print(
+            "Run --mode=matrix for the judgment worklist, then "
+            "--apply-judgments <decisions.json>, or record a Reviewer override."
+        )
+        return 2
+
     reviewer = _resolve_reviewer(args)
     kinds = args.kind or None
 
@@ -470,9 +622,21 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
     parser.add_argument("project_folder", help="Folder containing drawing PDF(s)")
     parser.add_argument(
         "--mode",
-        choices=["preview", "emit"],
+        choices=["preview", "emit", "matrix"],
         default="preview",
-        help="preview: print findings; emit: write annotated PDF via PyMuPDF (ADR-0012)",
+        help=(
+            "preview: print findings; emit: write annotated PDF via PyMuPDF "
+            "(ADR-0012); matrix: print the judgment-node worklist as JSON "
+            "(tripped invariants, pending evidence, disputed matrix rows; ADR-0026)"
+        ),
+    )
+    parser.add_argument(
+        "--apply-judgments",
+        metavar="DECISIONS_JSON",
+        help=(
+            "Apply a judgment node's decisions file (promote/dismiss/reclassify "
+            "evidence; resolve/override invariants) per ADR-0026, then exit"
+        ),
     )
     parser.add_argument(
         "--reviewer",
@@ -504,9 +668,14 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
 
     conn = drawing_queries.open_project_db(args.project_folder)
     try:
+        if args.apply_judgments:
+            return _drawing_apply_judgments(conn, args.apply_judgments)
+        if args.mode == "matrix":
+            return _drawing_matrix_report(conn)
         if args.mode == "emit":
             return _drawing_emit(conn, args)
         findings = drawing_queries.all_findings(conn)
+        gate_problems = _drawing_trust_gate(conn)
     finally:
         conn.close()
 
@@ -516,6 +685,12 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
 
     print(f"=== drawing-index-qc preview ({Path(args.project_folder).name}) ===")
     print(f"Total findings: {len(findings)}\n")
+
+    if gate_problems:
+        print("!! UNTRUSTED SCOPE (ADR-0026) — emit is blocked until resolved:")
+        for p in gate_problems:
+            print(f"  - {p}")
+        print("  Run --mode=matrix for the judgment worklist.\n")
 
     for kind in DRAWING_FINDING_KINDS:
         rows = by_kind.get(kind, [])

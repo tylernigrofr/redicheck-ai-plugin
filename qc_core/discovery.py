@@ -85,8 +85,17 @@ def _drawing_sort_key(path: Path) -> tuple:
     return (1, 0, name.lower())
 
 
+def _is_emit_output(path: Path) -> bool:
+    """True for our own `<name>.marked.pdf` emit outputs (ADR-0012). Without
+    this, a second run discovers the marked copy as a new volume and emits a
+    `.marked.marked.pdf`."""
+    return path.name.lower().endswith(".marked.pdf")
+
+
 def is_spec_pdf(path: Path) -> bool:
     if path.suffix.lower() != ".pdf":
+        return False
+    if _is_emit_output(path):
         return False
     return bool(SPEC_FILENAME_RE.search(path.name))
 
@@ -119,6 +128,8 @@ def _bookmarks_look_like_sheets(path: Path) -> bool:
 
 def is_drawing_pdf(path: Path) -> bool:
     if path.suffix.lower() != ".pdf":
+        return False
+    if _is_emit_output(path):
         return False
     if is_spec_pdf(path):
         return False
