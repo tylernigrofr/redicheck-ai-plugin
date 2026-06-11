@@ -9,9 +9,18 @@ Index specification and drawing PDFs into the project's `qc.sqlite` substrate.
 
 ## Usage
 
+Always invoke through the plugin venv — never rely on PATH resolution.
+
+**Windows (PowerShell):**
+```powershell
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\qc-index.exe" <project-folder>
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\qc-index.exe" <project-folder> --force
+```
+
+**macOS / Linux:**
 ```bash
-qc-index <project-folder>
-qc-index <project-folder> --force
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/qc-index" <project-folder>
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/qc-index" <project-folder> --force
 ```
 
 ## Behavior

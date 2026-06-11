@@ -513,9 +513,29 @@ def spec_check_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _render_scoreboard(scoreboard: list[dict]) -> str:
+    """Format scoreboard as an aligned text table."""
+    header = (
+        f"{'PREFIX':<8}  {'INDEX':>6}  {'BMKS':>6}  {'RECNC':>6}  {'DISP':>6}  {'ANOM':>5}  NOTE"
+    )
+    lines = [header, "-" * len(header)]
+    for row in scoreboard:
+        flag = " !" if row.get("zero_reconciled") else "  "
+        lines.append(
+            f"{row['prefix']:<8}{flag}  "
+            f"{row['index_count']:>6}  "
+            f"{row['bookmark_count']:>6}  "
+            f"{row['reconciled']:>6}  "
+            f"{row['disputed']:>6}  "
+            f"{row['anomalies']:>5}"
+        )
+    return "\n".join(lines)
+
+
 def _drawing_matrix_report(conn) -> int:
     """Print the judgment-node worklist as JSON (ADR-0026): tripped
-    invariants, pending Evidence findings, and disputed matrix rows."""
+    invariants, pending Evidence findings, disputed matrix rows, and
+    per-prefix scoreboard."""
     import json as _json
 
     from qc_core.drawing import matrix as drawing_matrix
@@ -525,18 +545,77 @@ def _drawing_matrix_report(conn) -> int:
         "invariants": drawing_matrix.all_invariants(conn),
         "pending_evidence": drawing_matrix.pending_evidence(conn),
         "disputed_rows": drawing_matrix.disputed_rows(conn),
+        "scoreboard": drawing_matrix.compute_scoreboard(conn),
     }
     print(_json.dumps(report, indent=2))
     return 0
 
 
-def _drawing_apply_judgments(conn, path: str) -> int:
+def _drawing_sweep_report(conn, as_json: bool) -> int:
+    """--mode=sweep: scoreboard for all prefixes + raw dumps for suspicious ones."""
     import json as _json
 
     from qc_core.drawing import matrix as drawing_matrix
 
+    worklist = drawing_matrix.sweep_worklist(conn)
+
+    if as_json:
+        print(_json.dumps(worklist, indent=2))
+        return 0
+
+    print("=== completeness sweep ===")
+    print(
+        "Clean prefixes show as one scoreboard line. "
+        "Suspicious prefixes (anomalies/disputes/zero-reconciled/count-mismatch) get full raw dumps.\n"
+    )
+    header = (
+        f"{'PREFIX':<8}  {'INDEX':>6}  {'BMKS':>6}  {'RECNC':>6}  {'DISP':>6}  {'ANOM':>5}  NOTE"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in worklist:
+        flag = " !" if row.get("zero_reconciled") else "  "
+        status = "[suspicious]" if row["suspicious"] else ""
+        print(
+            f"{row['prefix']:<8}{flag}  "
+            f"{row['index_count']:>6}  "
+            f"{row['bookmark_count']:>6}  "
+            f"{row['reconciled']:>6}  "
+            f"{row['disputed']:>6}  "
+            f"{row['anomalies']:>5}  {status}"
+        )
+        if row["suspicious"]:
+            idx = row.get("index_rows") or []
+            bmk = row.get("bookmark_rows") or []
+            anm = row.get("anomaly_rows") or []
+            if idx:
+                print(f"  index rows ({len(idx)}):")
+                for e in idx:
+                    print(f"    p.{e['page']:>3}  raw={e['raw']!r}  key={e['key']!r}")
+            if bmk:
+                print(f"  bookmark rows ({len(bmk)}):")
+                for e in bmk:
+                    print(f"    p.{e['page']:>3}  raw={e['raw']!r}  key={e['key']!r}")
+            if anm:
+                print(f"  parse anomalies ({len(anm)}):")
+                for e in anm:
+                    print(f"    {e['sheet_number']!r}  {e['notes'] or ''}")
+            print()
+    return 0
+
+
+def _drawing_apply_judgments(conn, path: str) -> int:
+    import json as _json
+    import sys as _sys
+
+    from qc_core.drawing import matrix as drawing_matrix
+
     payload = _json.loads(Path(path).read_text(encoding="utf-8"))
-    applied = drawing_matrix.apply_judgments(conn, payload)
+    try:
+        applied = drawing_matrix.apply_judgments(conn, payload)
+    except ValueError as exc:
+        print(f"error: {exc}", file=_sys.stderr)
+        return 1
     conn.commit()
     print(
         f"judgments applied: {applied['promoted']} promoted, "
@@ -615,6 +694,199 @@ def _drawing_emit(conn, args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Read-only inspection helpers (--show-index / --show-bookmarks / --explain)
+# ---------------------------------------------------------------------------
+
+
+def _inspect_show_index(conn, volume: int | None, as_json: bool) -> int:
+    """Print parsed index rows from drawing_index_entries."""
+    import json as _json
+
+    from qc_core.drawing.parse import normalize_sheet_number
+
+    query = (
+        "SELECT e.volume_id, e.sheet_number, e.title, e.source, e.index_page "
+        "FROM drawing_index_entries e "
+    )
+    params: list = []
+    if volume is not None:
+        query += "WHERE e.volume_id = ? "
+        params.append(volume)
+    query += "ORDER BY e.volume_id, e.index_page, e.sheet_number"
+
+    rows = conn.execute(query, params).fetchall()
+
+    if as_json:
+        out = [
+            {
+                "volume_id": r["volume_id"],
+                "raw_value": r["sheet_number"],
+                "normalized_key": normalize_sheet_number(r["sheet_number"]),
+                "title": r["title"],
+                "source": r["source"],
+                "index_page": r["index_page"],
+            }
+            for r in rows
+        ]
+        print(_json.dumps(out, indent=2))
+        return 0
+
+    print(f"drawing_index_entries ({len(rows)} rows)")
+    for r in rows:
+        norm = normalize_sheet_number(r["sheet_number"])
+        raw = r["sheet_number"]
+        arrow = f"{raw!r} -> {norm!r}" if raw != norm else repr(raw)
+        print(
+            f"  vol={r['volume_id']} p.{r['index_page']:>3}  {arrow}"
+            f"  [{r['source']}]"
+            + (f"  title={r['title']!r}" if r["title"] else "")
+        )
+    return 0
+
+
+def _inspect_show_bookmarks(conn, discipline: str | None, as_json: bool) -> int:
+    """Print sheet catalog from drawing_sheets (bookmark channel)."""
+    import json as _json
+
+    from qc_core.drawing.parse import normalize_sheet_number
+
+    query = (
+        "SELECT s.volume_id, s.sheet_number, s.title, s.page "
+        "FROM drawing_sheets s "
+    )
+    params: list = []
+    if discipline is not None:
+        query += "WHERE upper(s.sheet_number) LIKE upper(?) "
+        params.append(f"{discipline}%")
+    query += "ORDER BY s.volume_id, s.page, s.sheet_number"
+
+    rows = conn.execute(query, params).fetchall()
+
+    if as_json:
+        out = [
+            {
+                "volume_id": r["volume_id"],
+                "raw_value": r["sheet_number"],
+                "normalized_key": normalize_sheet_number(r["sheet_number"]),
+                "title": r["title"],
+                "page": r["page"],
+                "discipline": (r["sheet_number"] or "")[:1].upper() or None,
+            }
+            for r in rows
+        ]
+        print(_json.dumps(out, indent=2))
+        return 0
+
+    print(f"drawing_sheets / bookmarks ({len(rows)} rows)")
+    for r in rows:
+        norm = normalize_sheet_number(r["sheet_number"])
+        raw = r["sheet_number"]
+        arrow = f"{raw!r} -> {norm!r}" if raw != norm else repr(raw)
+        disc = (raw or "")[:1].upper() or "?"
+        print(
+            f"  vol={r['volume_id']} p.{r['page']:>3}  {arrow}"
+            f"  disc={disc}"
+            + (f"  title={r['title']!r}" if r["title"] else "")
+        )
+    return 0
+
+
+def _inspect_explain(conn, sheet: str, as_json: bool) -> int:
+    """Show one key across every channel: matrix rows, findings, invariants."""
+    import json as _json
+
+    from qc_core.drawing.parse import normalize_sheet_number
+    from qc_core.drawing.matrix import CHECK_NAME
+
+    key = normalize_sheet_number(sheet)
+
+    matrix_rows = conn.execute(
+        "SELECT channel, raw_value, page, detail "
+        "FROM reconciliation_matrix "
+        "WHERE check_name = ? AND entity_key = ? "
+        "ORDER BY channel, page",
+        (CHECK_NAME, key),
+    ).fetchall()
+
+    findings_rows = conn.execute(
+        "SELECT kind, status, judgment_rationale "
+        "FROM findings "
+        "WHERE sheet_number = ? OR sheet_number = ? "
+        "ORDER BY kind",
+        (key, sheet),
+    ).fetchall()
+
+    # Invariants whose scope is a prefix of this key
+    prefix = key[:1].upper() if key else ""
+    invariant_rows = conn.execute(
+        "SELECT invariant, scope, status, rationale "
+        "FROM invariant_results "
+        "WHERE check_name = ? AND scope = ? "
+        "ORDER BY invariant",
+        (CHECK_NAME, prefix),
+    ).fetchall() if prefix else []
+
+    if as_json:
+        out = {
+            "sheet": sheet,
+            "normalized_key": key,
+            "matrix": [
+                {
+                    "channel": r["channel"],
+                    "raw_value": r["raw_value"],
+                    "page": r["page"],
+                    "detail": _json.loads(r["detail"]) if r["detail"] else None,
+                }
+                for r in matrix_rows
+            ],
+            "findings": [
+                {
+                    "kind": r["kind"],
+                    "status": r["status"],
+                    "judgment_rationale": r["judgment_rationale"],
+                }
+                for r in findings_rows
+            ],
+            "invariants": [
+                {
+                    "invariant": r["invariant"],
+                    "scope": r["scope"],
+                    "status": r["status"],
+                    "rationale": r["rationale"],
+                }
+                for r in invariant_rows
+            ],
+        }
+        print(_json.dumps(out, indent=2))
+        return 0
+
+    print(f"=== explain {sheet!r}  (normalized: {key!r}) ===")
+    print(f"\nMatrix channels ({len(matrix_rows)} rows):")
+    if matrix_rows:
+        for r in matrix_rows:
+            detail = f"  detail={r['detail']}" if r["detail"] else ""
+            print(f"  [{r['channel']}]  raw={r['raw_value']!r}  p.{r['page']}{detail}")
+    else:
+        print("  (no matrix rows — key not yet indexed)")
+
+    print(f"\nFindings ({len(findings_rows)} rows):")
+    if findings_rows:
+        for r in findings_rows:
+            rat = f"  rationale={r['judgment_rationale']!r}" if r["judgment_rationale"] else ""
+            print(f"  kind={r['kind']}  status={r['status']}{rat}")
+    else:
+        print("  (none)")
+
+    if invariant_rows:
+        print(f"\nInvariants covering prefix {prefix!r}:")
+        for r in invariant_rows:
+            rat = f"  rationale={r['rationale']!r}" if r["rationale"] else ""
+            print(f"  {r['invariant']}  scope={r['scope']}  status={r['status']}{rat}")
+
+    return 0
+
+
 def drawing_index_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Drawing index QC via qc.sqlite (preview or emit)."
@@ -622,12 +894,14 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
     parser.add_argument("project_folder", help="Folder containing drawing PDF(s)")
     parser.add_argument(
         "--mode",
-        choices=["preview", "emit", "matrix"],
+        choices=["preview", "emit", "matrix", "sweep"],
         default="preview",
         help=(
-            "preview: print findings; emit: write annotated PDF via PyMuPDF "
+            "preview: print findings with scoreboard; emit: write annotated PDF via PyMuPDF "
             "(ADR-0012); matrix: print the judgment-node worklist as JSON "
-            "(tripped invariants, pending evidence, disputed matrix rows; ADR-0026)"
+            "(tripped invariants, pending evidence, disputed matrix rows, scoreboard; ADR-0026); "
+            "sweep: completeness sweep worklist — scoreboard for all prefixes + raw side-by-side "
+            "dumps for suspicious ones (ADR-0027)"
         ),
     )
     parser.add_argument(
@@ -660,22 +934,78 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Overwrite the source PDF instead of writing <name>.marked.pdf",
     )
+    # Read-only inspection flags (ADR-0027 / issue #68)
+    parser.add_argument(
+        "--show-index",
+        action="store_true",
+        help=(
+            "Print parsed index rows from drawing_index_entries "
+            "(raw value -> normalized key, source, page). Read-only."
+        ),
+    )
+    parser.add_argument(
+        "--volume",
+        type=int,
+        metavar="N",
+        help="Filter --show-index to volume N.",
+    )
+    parser.add_argument(
+        "--show-bookmarks",
+        action="store_true",
+        help=(
+            "Print sheet catalog from drawing_sheets (bookmark channel): "
+            "raw title -> normalized key, page, discipline. Read-only."
+        ),
+    )
+    parser.add_argument(
+        "--discipline",
+        metavar="PREFIX",
+        help="Filter --show-bookmarks to sheets whose number starts with PREFIX.",
+    )
+    parser.add_argument(
+        "--explain",
+        metavar="SHEET",
+        help=(
+            "Show one key across every channel: matrix rows, findings, invariants "
+            "covering that prefix. Accepts raw or normalized sheet number. Read-only."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Emit machine-readable JSON (all inspection commands).",
+    )
     args = parser.parse_args(argv)
 
-    if _needs_full_index(args.project_folder):
+    # Inspection commands are read-only; skip the stale-index check so they
+    # work even when invariants are tripped and emit is blocked.
+    is_inspect = args.show_index or args.show_bookmarks or bool(args.explain)
+
+    if not is_inspect and _needs_full_index(args.project_folder):
         print("qc.sqlite missing or stale — running qc-index...")
         _run_qc_index(args.project_folder)
 
     conn = drawing_queries.open_project_db(args.project_folder)
     try:
+        if args.show_index:
+            return _inspect_show_index(conn, args.volume, args.as_json)
+        if args.show_bookmarks:
+            return _inspect_show_bookmarks(conn, args.discipline, args.as_json)
+        if args.explain:
+            return _inspect_explain(conn, args.explain, args.as_json)
         if args.apply_judgments:
             return _drawing_apply_judgments(conn, args.apply_judgments)
         if args.mode == "matrix":
             return _drawing_matrix_report(conn)
+        if args.mode == "sweep" or getattr(args, "sweep", False):
+            return _drawing_sweep_report(conn, args.as_json)
         if args.mode == "emit":
             return _drawing_emit(conn, args)
         findings = drawing_queries.all_findings(conn)
         gate_problems = _drawing_trust_gate(conn)
+        from qc_core.drawing import matrix as drawing_matrix
+        scoreboard = drawing_matrix.compute_scoreboard(conn)
     finally:
         conn.close()
 
@@ -685,6 +1015,11 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
 
     print(f"=== drawing-index-qc preview ({Path(args.project_folder).name}) ===")
     print(f"Total findings: {len(findings)}\n")
+
+    # Scoreboard at top of preview (Part 2)
+    if scoreboard:
+        print(_render_scoreboard(scoreboard))
+        print()
 
     if gate_problems:
         print("!! UNTRUSTED SCOPE (ADR-0026) — emit is blocked until resolved:")

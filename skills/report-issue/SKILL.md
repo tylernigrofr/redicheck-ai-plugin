@@ -54,18 +54,30 @@ See `/help` for canonical rules. Offer this skill when:
 
 3. **Confirm** — Reviewer approves or edits before submit.
 
-4. **Submit** — run CLI (plugin venv):
+4. **Submit** — run CLI through the plugin venv — never bare PATH:
 
+   **Windows (PowerShell):**
+   ```powershell
+   & "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\report-issue.exe" --title "[skill] short summary" --body-file -
+   ```
+
+   **macOS / Linux:**
    ```bash
-   report-issue --title "[skill] short summary" --body-file -
+   "${CLAUDE_PLUGIN_ROOT}/.venv/bin/report-issue" --title "[skill] short summary" --body-file -
    ```
 
    Paste approved body on stdin. On success, output includes Linear issue id + URL.
 
    Dry-run (no network):
 
+   **Windows (PowerShell):**
+   ```powershell
+   & "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\report-issue.exe" --title "[skill] short summary" --body-file - --dry-run
+   ```
+
+   **macOS / Linux:**
    ```bash
-   report-issue --title "[skill] short summary" --body-file - --dry-run
+   "${CLAUDE_PLUGIN_ROOT}/.venv/bin/report-issue" --title "[skill] short summary" --body-file - --dry-run
    ```
 
 5. **Confirm** — tell Reviewer Tyler triages Linear Feedback on his regular cadence.

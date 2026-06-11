@@ -9,13 +9,26 @@ Run spec-check against indexed data in `qc.sqlite`.
 
 ## Usage
 
+Always invoke through the plugin venv — never rely on PATH resolution.
+
+**Windows (PowerShell):**
+```powershell
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\spec-check.exe" <project-folder> --mode=preview
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\spec-check.exe" <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\spec-check.exe" <project-folder> --mode=emit
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\spec-check.exe" <project-folder> --mode=emit --kind broken_related_ref
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\spec-check.exe" <project-folder> --mode=emit --kind broken_related_ref --kind toc_not_in_body
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\spec-check.exe" <project-folder> --mode=emit --in-place
+```
+
+**macOS / Linux:**
 ```bash
-spec-check <project-folder> --mode=preview
-spec-check <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
-spec-check <project-folder> --mode=emit                      # uses qc.config.toml, else default reviewer
-spec-check <project-folder> --mode=emit --kind broken_related_ref   # only this kind
-spec-check <project-folder> --mode=emit --kind broken_related_ref --kind toc_not_in_body
-spec-check <project-folder> --mode=emit --in-place
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/spec-check" <project-folder> --mode=preview
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/spec-check" <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/spec-check" <project-folder> --mode=emit
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/spec-check" <project-folder> --mode=emit --kind broken_related_ref
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/spec-check" <project-folder> --mode=emit --kind broken_related_ref --kind toc_not_in_body
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/spec-check" <project-folder> --mode=emit --in-place
 ```
 
 Reviewer resolution: `--reviewer` > `qc.config.toml [reviewer] name` >
@@ -53,7 +66,7 @@ name = "REDICHECK-TKN"
 ## Reviewer workflow (Studio-hosted PDF)
 
 1. In Revu, **Download** Specs.pdf from the Studio Project to your project folder.
-2. Run `spec-check <project-folder> --mode=emit --reviewer "<You>"`.
+2. Run `spec-check` via the plugin venv (see Usage above) with `<project-folder> --mode=emit --reviewer "<You>"`.
 3. Open the resulting `Specs.marked.pdf` (or the in-place file) in Revu and triage in the Markups List.
 4. **Upload** the reviewed PDF back to Studio as a new revision.
 

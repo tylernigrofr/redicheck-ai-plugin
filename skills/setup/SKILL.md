@@ -60,8 +60,14 @@ See `docs/onboarding.md`:
 
 5. **Optional:** verify `/report-issue` dry-run:
 
+   **Windows (PowerShell):**
+   ```powershell
+   & "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\report-issue.exe" --title "setup smoke test" --body "post-setup check" --dry-run
+   ```
+
+   **macOS / Linux:**
    ```bash
-   report-issue --title "setup smoke test" --body "post-setup check" --dry-run
+   "${CLAUDE_PLUGIN_ROOT}/.venv/bin/report-issue" --title "setup smoke test" --body "post-setup check" --dry-run
    ```
 
    Output should show the proxy URL and JSON payload. Omit `--dry-run` to submit a real Linear issue.

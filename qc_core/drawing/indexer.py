@@ -89,6 +89,7 @@ def index_drawing_pdf(
         volume_id = existing["id"]
         conn.execute("DELETE FROM drawing_sheets WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM drawing_index_entries WHERE volume_id = ?", (volume_id,))
+        conn.execute("DELETE FROM drawing_parse_anomalies WHERE volume_id = ?", (volume_id,))
         conn.execute(
             """
             UPDATE drawing_volumes
@@ -147,12 +148,33 @@ def index_drawing_pdf(
             ),
         )
 
+    import json as _json
+
+    for anom in result.get("bookmark_anomalies", []):
+        conn.execute(
+            "INSERT INTO drawing_parse_anomalies (volume_id, channel, raw_text, page, detail) "
+            "VALUES (?, 'bookmarks', ?, ?, ?)",
+            (volume_id, anom["raw"], anom.get("page"),
+             _json.dumps({k: v for k, v in anom.items() if k not in ("raw", "page")})),
+        )
+
+    for anom in result.get("index_anomalies", []):
+        channel = anom.get("channel", "volume_index")
+        conn.execute(
+            "INSERT INTO drawing_parse_anomalies (volume_id, channel, raw_text, page, detail) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (volume_id, channel, anom["raw"], anom.get("page"),
+             _json.dumps({k: v for k, v in anom.items() if k not in ("raw", "page", "channel")})),
+        )
+
     return {
         "indexed": True,
         "volume_id": volume_id,
         "pdf_path": str(path),
         "sheets": len(result["sheets"]),
         "index_entries": len(result["index_entries"]),
+        "bookmark_anomalies": len(result.get("bookmark_anomalies", [])),
+        "index_anomalies": len(result.get("index_anomalies", [])),
         "meta": meta,
         "titleblock_mismatches": result.get("titleblock_mismatches", []),
         "bookmark_parse_warning": meta.get("bookmark_parse_warning"),
@@ -236,6 +258,42 @@ def _emit_sheet_discipline_review_findings(conn: sqlite3.Connection) -> None:
             )
 
 
+def _emit_parse_anomaly_findings(conn: sqlite3.Connection) -> None:
+    """Insert parse_anomaly findings from drawing_parse_anomalies (ADR-0027, issue #65).
+
+    Each raw extraction failure becomes a finding at status='evidence' with
+    expected_action='info_only'.  The raw source text is stored in notes;
+    the channel is stored in context.  Since _clear_drawing_findings deletes
+    all drawing findings before each recompute, these rows are rebuilt fresh
+    on every run — idempotency is guaranteed by the delete-then-reinsert cycle.
+
+    Anomaly findings are deliberately held at status='evidence' so the emit
+    gate blocks until they are judged via --apply-judgments.  The typical
+    judgment action is 'promote' (keeping them as info markers) or 'dismiss'
+    (noise, e.g. a page header that looks like a near-miss).
+    """
+    rows = conn.execute(
+        "SELECT volume_id, channel, raw_text, page FROM drawing_parse_anomalies "
+        "ORDER BY volume_id, channel, id"
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO findings (
+                drawing_volume_id, kind, expected_action, severity,
+                sheet_number, source_page, notes, context, status, evidence_key
+            ) VALUES (?, 'parse_anomaly', 'info_only', 'low', NULL, ?, ?, ?, 'evidence', ?)
+            """,
+            (
+                row["volume_id"],
+                row["page"],
+                row["raw_text"],
+                f"channel={row['channel']}",
+                f"parse_anomaly:{row['volume_id']}:{row['channel']}:{row['raw_text'][:80]}",
+            ),
+        )
+
+
 def compute_drawing_findings(conn: sqlite3.Connection) -> None:
     """Project-level cross-ref: index vs bookmark catalog (ADR-0014).
 
@@ -257,6 +315,51 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
             "SELECT id, pdf_path FROM drawing_volumes ORDER BY id"
         ).fetchall()
     }
+
+    # Detect duplicate sheet numbers in the bookmark catalog before building the
+    # deduped dict.  Two bookmarks with the same normalized number in one volume
+    # mean the set physically contains a sheet whose number was used twice (e.g.
+    # two `E. 304` pages where one should be `E. 305`).
+    #
+    # Guard: a key collision is only a duplicate-sheet finding when corroborated
+    # — either the index lists the key exactly once (two physical pages claim an
+    # indexed number: Elk Grove 'E. 304'), or every colliding bookmark carries
+    # the identical title (a duplicated/corrupt TOC entry: Elk Grove 'C4' twice,
+    # one pointing at the cover page).  Sets whose bookmark numbering splits
+    # across the number/title fields (Quarry Oaks MEP: sheet 'E-1', titles
+    # '01 - ...', '02 - ...') produce mass collisions ('E1' x38) with differing
+    # titles and no matching index key — channel noise that belongs to
+    # reconciliation, not this check.  A genuine duplicate that fails both
+    # corroborations still surfaces as sheet_in_set_not_in_index.
+    _index_key_counts: dict[str, int] = {}
+    for row in conn.execute("SELECT sheet_number FROM drawing_index_entries").fetchall():
+        k = normalize_sheet_number(row["sheet_number"])
+        _index_key_counts[k] = _index_key_counts.get(k, 0) + 1
+    _bookmark_counts: dict[tuple[int, str], int] = {}
+    _bookmark_first: dict[tuple[int, str], dict] = {}
+    _bookmark_titles: dict[tuple[int, str], set[str]] = {}
+    for row in conn.execute(
+        "SELECT volume_id, sheet_number, title, page FROM drawing_sheets"
+    ).fetchall():
+        key = (row["volume_id"], normalize_sheet_number(row["sheet_number"]))
+        _bookmark_counts[key] = _bookmark_counts.get(key, 0) + 1
+        _bookmark_first.setdefault(key, dict(row))
+        _bookmark_titles.setdefault(key, set()).add((row["title"] or "").strip().upper())
+    for (vol_id, _norm_key), count in _bookmark_counts.items():
+        corroborated = (
+            _index_key_counts.get(_norm_key) == 1
+            or len(_bookmark_titles[(vol_id, _norm_key)]) == 1
+        )
+        if count > 1 and corroborated:
+            first = _bookmark_first[(vol_id, _norm_key)]
+            _insert_finding(
+                conn,
+                kind="duplicate_sheet_number",
+                sheet_number=first["sheet_number"],
+                drawing_volume_id=vol_id,
+                source_page=first["page"],
+                notes=f"bookmarks x{count}",
+            )
 
     sheets_by_volume: dict[int, dict[str, dict]] = {}
     for row in conn.execute(
@@ -494,6 +597,7 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
                 )
 
     _emit_sheet_discipline_review_findings(conn)
+    _emit_parse_anomaly_findings(conn)
 
     # Hold baseline verdicts on untrusted scopes at Evidence (ADR-0026 §6a):
     # a tripped invariant means parse-completeness on that prefix is suspect,
@@ -559,7 +663,7 @@ def index_project(
                 except Exception:
                     continue
                 try:
-                    bookmarks, _rate = extract_bookmarks(doc)
+                    bookmarks, _rate, _anoms = extract_bookmarks(doc)
                 finally:
                     doc.close()
                 project_prefixes |= _prefixes(s["sheet_number"] for s in bookmarks)

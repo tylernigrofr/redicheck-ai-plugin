@@ -9,10 +9,20 @@ Run door indexing and duplicate detection against `qc.sqlite` (issue #34).
 
 ## Usage
 
+Always invoke through the plugin venv — never rely on PATH resolution.
+
+**Windows (PowerShell):**
+```powershell
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\door-check.exe" <project-folder> --mode=preview
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\door-check.exe" <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
+& "$env:CLAUDE_PLUGIN_ROOT\.venv\Scripts\door-check.exe" <project-folder> --mode=emit --in-place
+```
+
+**macOS / Linux:**
 ```bash
-door-check <project-folder> --mode=preview
-door-check <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
-door-check <project-folder> --mode=emit --in-place
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/door-check" <project-folder> --mode=preview
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/door-check" <project-folder> --mode=emit --reviewer "REDICHECK-TKN"
+"${CLAUDE_PLUGIN_ROOT}/.venv/bin/door-check" <project-folder> --mode=emit --in-place
 ```
 
 ## Behavior

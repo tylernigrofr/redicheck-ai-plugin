@@ -41,6 +41,18 @@ SHEET_TOKEN_RE = re.compile(
 )
 _SHEET_PREFIX_RE = re.compile(r"^([A-Z]{1,4})")
 
+# Bookmarks and raw index text produced by some firms include a space between
+# the discipline prefix and the sheet number — e.g. "E. 000", "EP. 100",
+# "EX. A".  Collapse these before applying any sheet-number grammar so both
+# channels agree.  The pattern requires an alphanumeric character after the
+# space so that a bare "E. -" (no number) is never silently accepted.
+_PREFIX_SPACE_RE = re.compile(r"^([A-Z]{1,4}\.)\s+([A-Za-z0-9])", re.IGNORECASE)
+
+
+def _normalize_prefix_space(text: str) -> str:
+    """Collapse 'E. 000' → 'E.000', 'EP. 100' → 'EP.100', 'EX. A' → 'EX.A'."""
+    return _PREFIX_SPACE_RE.sub(r"\1\2", text, count=1)
+
 
 def normalize_sheet_number(raw: str) -> str:
     """Comparison key — collapse whitespace and hyphens (legacy compare_with_index)."""
@@ -62,16 +74,34 @@ def _is_plausible_sheet_token(token: str) -> bool:
     return bool(re.match(r"^[A-Z]", sn))
 
 
-def extract_bookmarks(doc: fitz.Document) -> tuple[list[dict], float]:
-    """Depth-2 TOC entries as sheet catalog (method A)."""
+def extract_bookmarks(
+    doc: fitz.Document,
+) -> tuple[list[dict], float, list[dict]]:
+    """Depth-2 TOC entries as sheet catalog (method A).
+
+    Returns (parsed, parse_rate, anomalies).  Anomalies are depth-2 entries
+    that fail to produce a grammar-valid sheet number after normalization —
+    they are emitted as parse_anomaly findings (ADR-0027 / issue #65).
+    parse_rate is derived from countable rows: len(parsed) / depth2.
+    """
     depth2 = 0
     parsed: list[dict] = []
+    anomalies: list[dict] = []
     for level, title, page in doc.get_toc():
         if level != 2:
             continue
         depth2 += 1
-        m = BOOKMARK_RE.match(title.strip())
+        raw_title = title.strip()
+        normalized = _normalize_prefix_space(raw_title)
+        m = BOOKMARK_RE.match(normalized)
         if not m:
+            anomalies.append(
+                {
+                    "raw": raw_title,
+                    "page": int(page),
+                    "reason": "bookmark_re_no_match",
+                }
+            )
             continue
         parsed.append(
             {
@@ -82,7 +112,7 @@ def extract_bookmarks(doc: fitz.Document) -> tuple[list[dict], float]:
             }
         )
     rate = (len(parsed) / depth2) if depth2 else 0.0
-    return parsed, rate
+    return parsed, rate, anomalies
 
 
 _LETTERSPACE_RE = re.compile(r"(?<=\b[A-Za-z]) (?=[A-Za-z]\b)")
@@ -200,6 +230,69 @@ def _normalize_date_row(ln: str) -> list[str]:
     return [ln]
 
 
+# Near-miss index line: a leading token that looks sheet-number-shaped
+# (1-4 letter prefix immediately followed by a digit, total ≤ 10 chars, no
+# hyphens in mid-token) but fails strict _SHEET_CORE, followed by a clearly
+# title-like remainder (at least two words starting with an uppercase letter).
+# This tight structure keeps out material codes (TR-CL-16), fire-rating
+# standards (EN13501 - 1:CFL), and product numbers (B-35883, AOS130A4GM30K4).
+# Groups: (1) leading token, (2) remainder.
+_INDEX_NEAR_MISS_RE = re.compile(
+    r"^([A-Za-z]{1,4}\d[A-Za-z0-9.]{0,6})\s+([A-Z].{3,})$"
+)
+
+
+def extract_index_anomalies(lines: list[str]) -> list[dict]:
+    """Near-miss lines from an index page that failed _SHEET_CORE but look sheet-shaped.
+
+    A line qualifies as a near-miss when ALL of the following hold:
+    - _LINE_SHEET_RE rejected the line (strict grammar missed it)
+    - _inline_row also rejected it
+    - Leading token: 1-4 letters immediately followed by a digit (no leading
+      hyphen/dot), then up to 6 more alphanumeric/dot chars — total token
+      ≤ 10 chars — and token itself fails _LINE_SHEET_RE
+    - Remainder: starts uppercase, at least two words, no code-shaped
+      fragments at the front (colon-separated, dash-digit sequences)
+    - Line is not too long (prose) and remainder is not a date
+
+    Calibrated to produce zero anomalies on Quarry Oaks and Embassy Clearwater
+    fixture index pages (legends, dates, product codes, abbreviations excluded).
+    """
+    anomalies: list[dict] = []
+    for ln in lines:
+        ln_stripped = ln.strip()
+        if not ln_stripped:
+            continue
+        if _LINE_SHEET_RE.match(ln_stripped):
+            continue
+        if _inline_row(ln_stripped):
+            continue
+        m = _INDEX_NEAR_MISS_RE.match(ln_stripped)
+        if not m:
+            continue
+        token = m.group(1)
+        remainder = m.group(2)
+        # Token itself must fail _LINE_SHEET_RE; if valid, _inline_row excluded
+        # it for good reason (shallow single-prefix guard on inline rows).
+        if _LINE_SHEET_RE.match(token.upper()):
+            continue
+        # Remainder: at least two whitespace-separated words (title, not a code).
+        if len(remainder.split()) < 2:
+            continue
+        # Exclude code-like remainders: starts with digit, dash-digit, or has
+        # colon-separated fragments right after the token (fire-rating codes etc).
+        if re.match(r"^[\d\-]|\d:\w", remainder):
+            continue
+        # Exclude date-led remainders.
+        if re.match(r"^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}", remainder):
+            continue
+        # Exclude long prose lines.
+        if len(ln_stripped) > 100:
+            continue
+        anomalies.append({"raw": ln_stripped, "token": token, "remainder": remainder})
+    return anomalies
+
+
 def _parse_index_lines(lines: list[str]) -> list[dict]:
     """Walk lines, emit one entry per `SheetNum → Title` pair.
 
@@ -211,7 +304,19 @@ def _parse_index_lines(lines: list[str]) -> list[dict]:
     of the token-scrape noise (e.g. abbreviation codes on legend pages).
     Multi-line titles are accepted by greedy-extending to the next sheet line.
     """
-    lines = [out for ln in lines for out in _normalize_date_row(ln)]
+    # Normalize prefix-space forms ("E. 202" → "E.202") and strip trailing dots
+    # ("M203." → "M203") before any sheet-number grammar is applied.  Both are
+    # typographic quirks that appear in raw PDF text from some firms.
+    def _clean_index_line(s: str) -> str:
+        s = _normalize_prefix_space(s)
+        # Trailing dot only: strip when the result still looks sheet-shaped.
+        if s.endswith(".") and not s.endswith(".."):
+            candidate = s[:-1]
+            if _LINE_SHEET_RE.match(candidate):
+                return candidate
+        return s
+
+    lines = [_clean_index_line(out) for ln in lines for out in _normalize_date_row(ln)]
     entries: list[dict] = []
     seen: set[str] = set()
     i = 0
@@ -482,10 +587,11 @@ def analyze_pdf(
     cfg = config or DrawingIndexConfig()
     doc = fitz.open(path)
     try:
-        sheets, parse_rate = extract_bookmarks(doc)
+        sheets, parse_rate, bookmark_anomalies = extract_bookmarks(doc)
         index_page = find_index_page(doc)
         index_entries: list[dict] = []
         index_pages: list[int] = []
+        index_anomalies: list[dict] = []
         if index_page is not None:
             # Walk forward across continuation pages (some firms split the index across
             # multiple consecutive pages without repeating the INDEX header).
@@ -497,6 +603,7 @@ def analyze_pdf(
             page_of: dict[str, int] = {}
             for p in index_pages:
                 txt = doc[p - 1].get_text("text") or ""
+                raw_lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
                 for row in parse_index_page_text(txt):
                     key = row["sheet_number"]
                     if key in seen_keys:
@@ -504,6 +611,8 @@ def analyze_pdf(
                     seen_keys.add(key)
                     page_of[key] = p
                     raw_rows_all.append(row)
+                for anom in extract_index_anomalies(raw_lines):
+                    index_anomalies.append({**anom, "page": p})
             source = classify_index_scope(
                 sheets,
                 raw_rows_all,
@@ -532,6 +641,7 @@ def analyze_pdf(
                     raw_rows_all = []
                     index_pages = []
                     index_page = None
+                    index_anomalies = []
             for row in raw_rows_all:
                 index_entries.append(
                     {
@@ -541,6 +651,9 @@ def analyze_pdf(
                         "index_page": page_of[row["sheet_number"]],
                     }
                 )
+            # Tag anomalies with the resolved source channel
+            for anom in index_anomalies:
+                anom.setdefault("channel", source)
 
         tb_mismatches: list[dict] = []
         if cfg.title_block_calibrated and sheets:
@@ -551,6 +664,8 @@ def analyze_pdf(
             "sheets": sheets,
             "index_entries": index_entries,
             "titleblock_mismatches": tb_mismatches,
+            "bookmark_anomalies": bookmark_anomalies,
+            "index_anomalies": index_anomalies,
             "meta": {
                 "total_pages": doc.page_count,
                 "bookmark_parse_rate": round(parse_rate, 3),

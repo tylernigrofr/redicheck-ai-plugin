@@ -182,7 +182,190 @@ def evaluate_invariants(conn: sqlite3.Connection) -> list[dict]:
                 },
             )
 
+        # prefix_unreconciled: prefix has rows in BOTH bookmark and index
+        # channels but ZERO entity keys reconcile (no key present in both).
+        # Catches channel-wide key corruption that prefix_absent_* structurally
+        # misses — Elk Grove E had 30 index rows + 32 bookmarks, zero matches
+        # after the prefix-space truncation bug (#64). Requires >=2 on each
+        # side to avoid tripping on prefixes where a 1-entry channel is simply
+        # noise (those are covered by prefix_absent_* already).
+        if (
+            has_any_index
+            and len(sheet_keys) >= 2
+            and len(index_keys) >= 2
+        ):
+            reconciled_keys = sheet_keys & index_keys
+            if not reconciled_keys:
+                _trip(
+                    "prefix_unreconciled",
+                    prefix,
+                    {
+                        "bookmark_count": len(sheet_keys),
+                        "index_count": len(index_keys),
+                        "sample_bookmarks": sorted(sheet_keys)[:5],
+                        "sample_index": sorted(index_keys)[:5],
+                    },
+                )
+
+    # completeness_sweep: synthetic invariant — always trips on every
+    # evaluate_invariants() call (representing the mandatory holistic sweep
+    # before emit, ADR-0027 §4). Resolved only via --apply-judgments with a
+    # rationale summarizing what was scanned. Re-trips whenever invariants are
+    # recomputed on a changed set.
+    _trip(
+        "completeness_sweep",
+        "__project__",
+        {
+            "note": (
+                "Mandatory completeness sweep before emit (ADR-0027). "
+                "Run --mode=sweep, scan suspicious prefixes for suppressed-class "
+                "issues, record resolution via --apply-judgments."
+            )
+        },
+    )
+
     return all_invariants(conn)
+
+
+def compute_scoreboard(conn: sqlite3.Connection) -> list[dict]:
+    """Per-prefix scoreboard from reconciliation_matrix + parse_anomaly findings.
+
+    Returns a list of dicts (one per prefix, plus one '??' row for anomalies
+    with no attributable prefix), sorted by prefix.  Each row:
+        prefix, index_count, bookmark_count, reconciled, disputed, anomalies,
+        zero_reconciled (bool flag for display).
+
+    Included in --mode=preview output and --mode=matrix JSON as 'scoreboard'
+    (ADR-0026 / issue #67 Part 2).
+    """
+    matrix_rows = conn.execute(
+        "SELECT entity_key, channel, raw_value FROM reconciliation_matrix "
+        "WHERE check_name = ?",
+        (CHECK_NAME,),
+    ).fetchall()
+
+    # Build per-prefix channel→key sets
+    by_prefix: dict[str, dict[str, set[str]]] = {}
+    for row in matrix_rows:
+        prefix = _prefix_of(row["raw_value"]) or _prefix_of(row["entity_key"])
+        if not prefix:
+            prefix = "??"
+        chans = by_prefix.setdefault(prefix, {})
+        chans.setdefault(row["channel"], set()).add(row["entity_key"])
+
+    # Determine which channels actually exist for the project
+    all_channels = {r["channel"] for r in matrix_rows}
+    has_index_channel = bool(all_channels & {CHANNEL_MASTER, CHANNEL_VOLUME})
+
+    # Per-prefix anomaly counts (parse_anomaly findings, ADR-0027 / #65)
+    anomaly_rows = conn.execute(
+        "SELECT sheet_number FROM findings WHERE kind = 'parse_anomaly'"
+    ).fetchall()
+    anomaly_by_prefix: dict[str, int] = {}
+    for arow in anomaly_rows:
+        sn = arow["sheet_number"] or ""
+        pfx = _prefix_of(sn) if sn else None
+        key = pfx if pfx else "??"
+        anomaly_by_prefix[key] = anomaly_by_prefix.get(key, 0) + 1
+
+    # Collect all prefixes from matrix and anomalies
+    all_prefixes = set(by_prefix.keys()) | set(anomaly_by_prefix.keys())
+
+    scoreboard = []
+    for prefix in sorted(all_prefixes):
+        chans = by_prefix.get(prefix, {})
+        bookmark_keys = chans.get(CHANNEL_BOOKMARKS, set())
+        index_keys = chans.get(CHANNEL_MASTER, set()) | chans.get(CHANNEL_VOLUME, set())
+        reconciled_keys = bookmark_keys & index_keys
+        disputed_keys = bookmark_keys.symmetric_difference(index_keys)
+        reconciled = len(reconciled_keys)
+        disputed = len(disputed_keys)
+        index_count = len(index_keys)
+        bookmark_count = len(bookmark_keys)
+        anomalies = anomaly_by_prefix.get(prefix, 0)
+        zero_reconciled = has_index_channel and bookmark_count > 0 and index_count > 0 and reconciled == 0
+        scoreboard.append(
+            {
+                "prefix": prefix,
+                "index_count": index_count,
+                "bookmark_count": bookmark_count,
+                "reconciled": reconciled,
+                "disputed": disputed,
+                "anomalies": anomalies,
+                "zero_reconciled": zero_reconciled,
+            }
+        )
+    return scoreboard
+
+
+def sweep_worklist(conn: sqlite3.Connection) -> list[dict]:
+    """Compute the sweep worklist for --mode=sweep.
+
+    Returns scoreboard for ALL prefixes plus full side-by-side raw dumps ONLY
+    for suspicious prefixes (any parse anomalies, any disputed rows,
+    reconciled==0, or index_count != bookmark_count).  Clean prefixes are
+    included as scoreboard-only rows (no dump).
+
+    Each entry:
+        prefix, index_count, bookmark_count, reconciled, disputed, anomalies,
+        zero_reconciled, suspicious (bool), index_rows (list|None), bookmark_rows (list|None).
+    """
+    scoreboard = compute_scoreboard(conn)
+
+    # Build raw side-by-side dumps for suspicious prefixes
+    matrix_rows = conn.execute(
+        "SELECT entity_key, channel, raw_value, page FROM reconciliation_matrix "
+        "WHERE check_name = ? ORDER BY page, entity_key",
+        (CHECK_NAME,),
+    ).fetchall()
+
+    from qc_core.drawing.parse import normalize_sheet_number
+
+    index_by_prefix: dict[str, list[dict]] = {}
+    bookmark_by_prefix: dict[str, list[dict]] = {}
+    for row in matrix_rows:
+        prefix = _prefix_of(row["raw_value"]) or _prefix_of(row["entity_key"]) or "??"
+        entry = {
+            "raw": row["raw_value"],
+            "key": row["entity_key"],
+            "page": row["page"],
+        }
+        if row["channel"] in (CHANNEL_MASTER, CHANNEL_VOLUME):
+            index_by_prefix.setdefault(prefix, []).append(entry)
+        elif row["channel"] == CHANNEL_BOOKMARKS:
+            bookmark_by_prefix.setdefault(prefix, []).append(entry)
+
+    anomaly_rows = conn.execute(
+        "SELECT sheet_number, notes FROM findings WHERE kind = 'parse_anomaly' ORDER BY sheet_number"
+    ).fetchall()
+    anomaly_by_prefix: dict[str, list[dict]] = {}
+    for arow in anomaly_rows:
+        sn = arow["sheet_number"] or ""
+        pfx = _prefix_of(sn) if sn else None
+        key = pfx if pfx else "??"
+        anomaly_by_prefix.setdefault(key, []).append({"sheet_number": sn, "notes": arow["notes"]})
+
+    result = []
+    for row in scoreboard:
+        prefix = row["prefix"]
+        suspicious = (
+            row["anomalies"] > 0
+            or row["disputed"] > 0
+            or row["zero_reconciled"]
+            or row["index_count"] != row["bookmark_count"]
+        )
+        entry = dict(row)
+        entry["suspicious"] = suspicious
+        if suspicious:
+            entry["index_rows"] = index_by_prefix.get(prefix, [])
+            entry["bookmark_rows"] = bookmark_by_prefix.get(prefix, [])
+            entry["anomaly_rows"] = anomaly_by_prefix.get(prefix, [])
+        else:
+            entry["index_rows"] = None
+            entry["bookmark_rows"] = None
+            entry["anomaly_rows"] = None
+        result.append(entry)
+    return result
 
 
 def all_invariants(conn: sqlite3.Connection) -> list[dict]:
@@ -203,6 +386,36 @@ def tripped_scopes(conn: sqlite3.Connection) -> set[str]:
     return {r["scope"] for r in rows if r["scope"]}
 
 
+def _normalize_raw(text: str) -> str:
+    """Strip, casefold, collapse internal whitespace for forgiving comparison."""
+    import re
+    return re.sub(r"\s+", " ", text.strip().casefold())
+
+
+def _raw_text_for_finding(conn: sqlite3.Connection, evidence_key: str) -> str | None:
+    """Return the stored raw source text for a finding row (ADR-0027 confirm-by-copying).
+
+    For parse_anomaly findings the raw text lives in ``notes``.
+    For reconciliation-based findings the raw text is the ``raw_value`` stored in
+    ``reconciliation_matrix`` for that evidence_key.  Returns None when no row is found.
+    """
+    row = conn.execute(
+        "SELECT kind, notes FROM findings WHERE evidence_key = ? AND status = 'evidence' LIMIT 1",
+        (evidence_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["kind"] == "parse_anomaly":
+        return row["notes"] or ""
+    # Reconciliation-based: look up raw_value from the matrix.  The entity_key
+    # stored in findings matches entity_key in reconciliation_matrix.
+    mat_row = conn.execute(
+        "SELECT raw_value FROM reconciliation_matrix WHERE check_name = ? AND entity_key = ? LIMIT 1",
+        (CHECK_NAME, evidence_key),
+    ).fetchone()
+    return mat_row["raw_value"] if mat_row else None
+
+
 def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
     """Apply a judgment node's schema-constrained decisions (ADR-0026 §3-4).
 
@@ -210,23 +423,81 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
         {
           "decisions": [
             {"evidence_key": str, "action": "promote"|"dismiss"|"reclassify",
-             "kind": str (required for reclassify), "rationale": str}
+             "kind": str (required for reclassify), "rationale": str,
+             "raw_text": str (required for dismiss — ADR-0027 confirm-by-copying)}
           ],
           "invariants": [
             {"id": int, "status": "resolved"|"overridden", "rationale": str}
           ]
         }
 
-    Decisions act on findings currently at status='evidence' for the given
-    entity-key. Rationale is recorded on the row (auditable, re-verifiable).
+    Dismiss decisions must include a ``raw_text`` field whose value string-matches
+    the stored raw source text of that evidence row (after strip+casefold+whitespace
+    collapse).  Missing or mismatched raw_text causes the entire file to be rejected
+    with an error listing each offending decision — nothing is written (atomic).
+
+    Promote and reclassify decisions do not require raw_text.
+
+    A shared rationale string appearing on more than 3 decisions in the file
+    triggers a warning (printed to stdout) but does not reject.
+
     Returns counts of applied changes.
     """
+    import sys
+    from collections import Counter
+
     from qc_core.drawing.kinds import DRAWING_FINDING_KINDS
+
+    decisions = payload.get("decisions", [])
+
+    # --- shared-rationale warning (before any writes) ---
+    rationale_counts: Counter = Counter()
+    for dec in decisions:
+        r = dec.get("rationale", "").strip()
+        if r:
+            rationale_counts[r] += 1
+    for rationale, count in rationale_counts.items():
+        if count > 3:
+            print(
+                f"WARNING: shared rationale across {count} rows — rationales must "
+                f"describe the row, not the defect (ADR-0027): \"{rationale}\"",
+                file=sys.stderr,
+            )
+
+    # --- strict raw_text validation for dismissals (all-or-nothing) ---
+    errors: list[str] = []
+    for dec in decisions:
+        if dec.get("action") != "dismiss":
+            continue
+        key = dec["evidence_key"]
+        provided = dec.get("raw_text")
+        if not provided:
+            expected = _raw_text_for_finding(conn, key)
+            hint = f' (expected: "{expected}")' if expected is not None else " (finding not found)"
+            errors.append(f"  dismiss {key!r}: raw_text missing{hint}")
+            continue
+        expected = _raw_text_for_finding(conn, key)
+        if expected is None:
+            # Finding not found — still validate as an error so the file is rejected
+            errors.append(f"  dismiss {key!r}: finding not found in evidence")
+            continue
+        if _normalize_raw(provided) != _normalize_raw(expected):
+            errors.append(
+                f"  dismiss {key!r}: raw_text mismatch\n"
+                f"    provided: \"{provided}\"\n"
+                f"    expected: \"{expected}\""
+            )
+    if errors:
+        raise ValueError(
+            "Decisions file rejected — raw_text confirm-by-copying failed (ADR-0027).\n"
+            "No changes were applied. Fix the following dismissals:\n"
+            + "\n".join(errors)
+        )
 
     applied = {"promoted": 0, "dismissed": 0, "reclassified": 0, "invariants": 0}
     kind_marks = ",".join("?" * len(DRAWING_FINDING_KINDS))
 
-    for dec in payload.get("decisions", []):
+    for dec in decisions:
         key = dec["evidence_key"]
         action = dec["action"]
         rationale = dec.get("rationale", "")
