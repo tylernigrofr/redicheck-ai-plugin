@@ -7,4 +7,5 @@ DRAWING_FINDING_KINDS = (
     "duplicate_sheet_number",
     "sheet_discipline_reviewer_resolution",
     "parse_anomaly",
+    "discipline_index_missing",
 )

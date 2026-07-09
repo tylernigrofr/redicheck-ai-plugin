@@ -248,8 +248,10 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
           ]
         }
 
-    Decisions act on findings currently at status='evidence' for the given
-    entity-key (the section number). Rationale is recorded on the row
+    Promote acts only on status='evidence' findings. Dismiss and reclassify
+    also act on status='candidate' findings (#84) — a Reviewer-refuted
+    Candidate needs the same recorded resolution path as an Evidence row, not
+    just Evidence-status findings. Rationale is recorded on the row
     (auditable, re-verifiable). Returns counts of applied changes.
     """
     applied = {"promoted": 0, "dismissed": 0, "reclassified": 0, "invariants": 0}
@@ -269,7 +271,8 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
         elif action == "dismiss":
             cur = conn.execute(
                 f"UPDATE findings SET status = 'dismissed', judgment_rationale = ? "
-                f"WHERE status = 'evidence' AND evidence_key = ? AND kind IN ({kind_marks})",
+                f"WHERE status IN ('evidence', 'candidate') AND evidence_key = ? "
+                f"AND kind IN ({kind_marks})",
                 (rationale, key, *SPEC_FINDING_KINDS),
             )
             applied["dismissed"] += cur.rowcount
@@ -280,7 +283,8 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
             cur = conn.execute(
                 f"UPDATE findings SET status = 'candidate', kind = ?, "
                 f"judgment_rationale = ? "
-                f"WHERE status = 'evidence' AND evidence_key = ? AND kind IN ({kind_marks})",
+                f"WHERE status IN ('evidence', 'candidate') AND evidence_key = ? "
+                f"AND kind IN ({kind_marks})",
                 (new_kind, rationale, key, *SPEC_FINDING_KINDS),
             )
             applied["reclassified"] += cur.rowcount

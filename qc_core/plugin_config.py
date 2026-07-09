@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-PLUGIN_VERSION: str = "0.4.0"
+PLUGIN_VERSION: str = "0.7.0"
 
 # Vercel proxy → Linear Feedback team. Override for staging / local testing.
 FEEDBACK_PROXY_URL: str = os.environ.get(

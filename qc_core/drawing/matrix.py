@@ -114,18 +114,35 @@ def evaluate_invariants(conn: sqlite3.Connection) -> list[dict]:
     }
 
     matrix = conn.execute(
-        "SELECT entity_key, channel, raw_value FROM reconciliation_matrix "
+        "SELECT entity_key, channel, raw_value, volume_id FROM reconciliation_matrix "
         "WHERE check_name = ?",
         (CHECK_NAME,),
     ).fetchall()
 
     by_prefix_channel: dict[str, dict[str, set[str]]] = {}
+    volumes_by_prefix: dict[str, set[int]] = {}
     for row in matrix:
         prefix = _prefix_of(row["raw_value"]) or _prefix_of(row["entity_key"])
         if not prefix:
             continue
         chans = by_prefix_channel.setdefault(prefix, {})
         chans.setdefault(row["channel"], set()).add(row["entity_key"])
+        if row["channel"] == CHANNEL_BOOKMARKS and row["volume_id"] is not None:
+            volumes_by_prefix.setdefault(prefix, set()).add(row["volume_id"])
+
+    # Per-volume extraction-blindness signals (issue #75), recorded at index
+    # time by index_drawing_pdf.
+    extraction_signals: dict[int, dict] = {}
+    volume_paths: dict[int, str] = {}
+    for vrow in conn.execute(
+        "SELECT id, pdf_path, extraction_signal FROM drawing_volumes"
+    ).fetchall():
+        volume_paths[vrow["id"]] = vrow["pdf_path"]
+        if vrow["extraction_signal"]:
+            try:
+                extraction_signals[vrow["id"]] = json.loads(vrow["extraction_signal"])
+            except (TypeError, ValueError):
+                pass
 
     has_any_index = any(
         r["channel"] in (CHANNEL_MASTER, CHANNEL_VOLUME) for r in matrix
@@ -160,14 +177,61 @@ def evaluate_invariants(conn: sqlite3.Connection) -> list[dict]:
             and len(sheet_keys) >= PREFIX_MIN_SHEETS
             and not index_keys
         ):
-            _trip(
-                "prefix_absent_from_index",
-                prefix,
-                {
-                    "sheets_in_set": len(sheet_keys),
-                    "sample": sorted(sheet_keys)[:5],
-                },
-            )
+            # index_unreadable (issue #75): zero index coverage, but the
+            # prefix's volume shows extraction blindness — an index header on
+            # a page yielding zero rows (flattened listing under a vector
+            # header band) or a majority of near-zero-text raster pages. The
+            # 1300 W 218th class: the index EXISTS, the extractor is blind,
+            # so concluding "discipline absent from index" is semantically
+            # wrong. Tripped INSTEAD of prefix_absent_from_index with the
+            # page-level evidence so the judgment node knows extraction
+            # failed rather than the index being absent.
+            blind_volumes = []
+            for vol_id in sorted(volumes_by_prefix.get(prefix, set())):
+                sig = extraction_signals.get(vol_id)
+                if not sig or not sig.get("suspected_raster"):
+                    continue
+                counts = sig.get("page_char_counts") or []
+                blind_volumes.append(
+                    {
+                        "volume_id": vol_id,
+                        "pdf_path": volume_paths.get(vol_id),
+                        "index_header_page": sig.get("index_header_page"),
+                        "header_page_chars": sig.get("header_page_chars"),
+                        "header_without_rows": sig.get("header_without_rows"),
+                        "index_rows_parsed": sig.get("index_rows_parsed", 0),
+                        "raster_pages": (sig.get("raster_pages") or [])[:10],
+                        "raster_page_fraction": sig.get("raster_page_fraction"),
+                        "page_char_counts": counts[:12],
+                    }
+                )
+            if blind_volumes:
+                _trip(
+                    "index_unreadable",
+                    prefix,
+                    {
+                        "sheets_in_set": len(sheet_keys),
+                        "sample": sorted(sheet_keys)[:5],
+                        "note": (
+                            "Zero index rows extracted, but the volume shows "
+                            "extraction blindness (raster/flattened pages or an "
+                            "index header with zero parsed rows). The index "
+                            "likely EXISTS; extraction is blind (issue #75). "
+                            "Verify visually / OCR before concluding the "
+                            "discipline is absent from the index."
+                        ),
+                        "blind_volumes": blind_volumes,
+                    },
+                )
+            else:
+                _trip(
+                    "prefix_absent_from_index",
+                    prefix,
+                    {
+                        "sheets_in_set": len(sheet_keys),
+                        "sample": sorted(sheet_keys)[:5],
+                    },
+                )
 
         # prefix_absent_from_set: an indexed group with zero physical sheets.
         # Either index parse noise that survived filtering, or a sub-project /
@@ -225,6 +289,135 @@ def evaluate_invariants(conn: sqlite3.Connection) -> list[dict]:
     )
 
     return all_invariants(conn)
+
+
+def evaluate_finding_contradictions(conn: sqlite3.Connection) -> list[dict]:
+    """ADR-0026: hold findings that contradict their own reconciliation matrix.
+
+    Must run AFTER findings are computed (unlike evaluate_invariants, which
+    only sees channel data) — this checks each `sheet_in_index_not_in_set` /
+    `sheet_in_set_not_in_index` finding's key against the SAME comparison its
+    own `notes` context claims to have made. Scoped per check, not a blind
+    bookmarks-vs-any-index union: a sheet can legitimately be absent from the
+    project MASTER index while present in a discipline volume's own small
+    sub-index (Quarry Oaks: ES-1-01/PS-1-01 exist only in MEP's own index,
+    genuinely absent from the project master index) — that's a real finding,
+    not a contradiction, so each `notes` context is checked against exactly
+    the channel(s) it claims to compare (NE A Street, 2026-07-02: 40 findings
+    on FM/LG/SP reached the Reviewer while the sweep scoreboard showed those
+    prefixes fully reconciled — issue #81). Trips `finding_contradicts_matrix`
+    per prefix and holds the contradicting findings at status='evidence' so
+    judgment must examine them before emit, regardless of which upstream bug
+    produced the contradiction.
+    """
+    matrix = conn.execute(
+        "SELECT entity_key, channel, volume_id FROM reconciliation_matrix WHERE check_name = ?",
+        (CHECK_NAME,),
+    ).fetchall()
+    project_bookmark_keys: set[str] = set()
+    project_master_keys: set[str] = set()
+    bookmark_keys_by_volume: dict[int, set[str]] = {}
+    volume_index_keys_by_volume: dict[int, set[str]] = {}
+    for r in matrix:
+        if r["channel"] == CHANNEL_BOOKMARKS:
+            project_bookmark_keys.add(r["entity_key"])
+            bookmark_keys_by_volume.setdefault(r["volume_id"], set()).add(r["entity_key"])
+        elif r["channel"] == CHANNEL_MASTER:
+            project_master_keys.add(r["entity_key"])
+        elif r["channel"] == CHANNEL_VOLUME:
+            volume_index_keys_by_volume.setdefault(r["volume_id"], set()).add(r["entity_key"])
+
+    kept = {
+        (r["invariant"], r["scope"])
+        for r in conn.execute(
+            "SELECT invariant, scope FROM invariant_results "
+            "WHERE check_name = ? AND invariant = 'finding_contradicts_matrix'",
+            (CHECK_NAME,),
+        ).fetchall()
+    }
+    conn.execute(
+        "DELETE FROM invariant_results WHERE check_name = ? "
+        "AND invariant = 'finding_contradicts_matrix' AND status = 'tripped'",
+        (CHECK_NAME,),
+    )
+
+    rows = conn.execute(
+        "SELECT id, kind, sheet_number, notes, drawing_volume_id FROM findings "
+        "WHERE kind IN ('sheet_in_index_not_in_set', 'sheet_in_set_not_in_index')"
+    ).fetchall()
+
+    def _is_contradiction(row: sqlite3.Row) -> bool:
+        key = normalize_sheet_number(row["sheet_number"] or "")
+        kind, notes, vol_id = row["kind"], row["notes"], row["drawing_volume_id"]
+        if notes == "master_index":
+            # Fired from project_set (all bookmarks) vs project master_index
+            # entries specifically (qc_core/drawing/indexer.py ~535-562).
+            if kind == "sheet_in_index_not_in_set":
+                return key in project_bookmark_keys
+            return key in project_master_keys
+        if notes == "volume_index":
+            # Fired per-volume: this volume's own index vs this volume's own
+            # bookmarks, or this volume's bookmarks vs (its own index UNION
+            # the project master index) — mirrors indexer.py ~570-611.
+            vol_bookmarks = bookmark_keys_by_volume.get(vol_id, set())
+            vol_index = volume_index_keys_by_volume.get(vol_id, set())
+            if kind == "sheet_in_index_not_in_set":
+                return key in vol_bookmarks
+            return key in vol_index or key in project_master_keys
+        if notes == "master_vs_volume_index":
+            # #79-fixed: already verifies against the volume's own bookmark
+            # catalog before flagging. A residual contradiction here means
+            # that fix's own check disagrees with the matrix.
+            vol_bookmarks = bookmark_keys_by_volume.get(vol_id, set())
+            if kind == "sheet_in_index_not_in_set":
+                return key in vol_bookmarks
+            return key in project_master_keys
+        # Unknown/other context: fall back to the coarse any-channel check.
+        return key in project_bookmark_keys and (
+            key in project_master_keys or key in volume_index_keys_by_volume.get(vol_id, set())
+        )
+
+    by_prefix: dict[str, list[dict]] = {}
+    for row in rows:
+        if not _is_contradiction(row):
+            continue
+        prefix = _prefix_of(row["sheet_number"] or "")
+        if prefix:
+            by_prefix.setdefault(prefix, []).append(dict(row))
+
+    tripped: list[dict] = []
+    held_ids: list[int] = []
+    for prefix, contradicting in sorted(by_prefix.items()):
+        if ("finding_contradicts_matrix", prefix) in kept:
+            continue  # Reviewer already resolved/overrode this scope
+        detail = {
+            "count": len(contradicting),
+            "contradicting_findings": [
+                {"kind": r["kind"], "sheet_number": r["sheet_number"]}
+                for r in contradicting[:10]
+            ],
+        }
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO invariant_results (
+                check_name, invariant, scope, status, detail
+            ) VALUES (?, 'finding_contradicts_matrix', ?, 'tripped', ?)
+            """,
+            (CHECK_NAME, prefix, json.dumps(detail)),
+        )
+        tripped.append(
+            {"invariant": "finding_contradicts_matrix", "scope": prefix, "detail": detail}
+        )
+        held_ids.extend(r["id"] for r in contradicting)
+
+    if held_ids:
+        placeholders = ",".join("?" * len(held_ids))
+        conn.execute(
+            f"UPDATE findings SET status = 'evidence' WHERE id IN ({placeholders})",
+            held_ids,
+        )
+
+    return tripped
 
 
 def compute_scoreboard(conn: sqlite3.Connection) -> list[dict]:
@@ -400,7 +593,8 @@ def _raw_text_for_finding(conn: sqlite3.Connection, evidence_key: str) -> str | 
     ``reconciliation_matrix`` for that evidence_key.  Returns None when no row is found.
     """
     row = conn.execute(
-        "SELECT kind, notes FROM findings WHERE evidence_key = ? AND status = 'evidence' LIMIT 1",
+        "SELECT kind, notes FROM findings WHERE evidence_key = ? "
+        "AND status IN ('evidence', 'candidate') LIMIT 1",
         (evidence_key,),
     ).fetchone()
     if row is None:
@@ -509,9 +703,14 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
             )
             applied["promoted"] += cur.rowcount
         elif action == "dismiss":
+            # #84: candidate-status findings can also be dismissed — a
+            # Reviewer-refuted Candidate needs the same recorded resolution
+            # path as an Evidence row (ADR-0027 confirm-by-copying still
+            # enforced above for both).
             cur = conn.execute(
                 f"UPDATE findings SET status = 'dismissed', judgment_rationale = ? "
-                f"WHERE status = 'evidence' AND evidence_key = ? AND kind IN ({kind_marks})",
+                f"WHERE status IN ('evidence', 'candidate') AND evidence_key = ? "
+                f"AND kind IN ({kind_marks})",
                 (rationale, key, *DRAWING_FINDING_KINDS),
             )
             applied["dismissed"] += cur.rowcount
@@ -522,7 +721,8 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
             cur = conn.execute(
                 f"UPDATE findings SET status = 'candidate', kind = ?, "
                 f"judgment_rationale = ? "
-                f"WHERE status = 'evidence' AND evidence_key = ? AND kind IN ({kind_marks})",
+                f"WHERE status IN ('evidence', 'candidate') AND evidence_key = ? "
+                f"AND kind IN ({kind_marks})",
                 (new_kind, rationale, key, *DRAWING_FINDING_KINDS),
             )
             applied["reclassified"] += cur.rowcount

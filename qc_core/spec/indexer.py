@@ -324,6 +324,20 @@ def compute_project_findings(
     Assumes spec_volumes / spec_sections(body) / spec_related_refs / toc_classes /
     toc_class_sections are all up to date for the current project state.
     """
+    # #84: a Reviewer's dismiss/reclassify judgment on a candidate finding is
+    # a durable Resolution (ADR-0024), not scoped to one evidence snapshot —
+    # preserve it across the delete-then-reinsert recompute cycle below so a
+    # plain reindex doesn't resurrect a finding the Reviewer already refuted.
+    prior_judgments = {
+        (r["evidence_key"], r["kind"]): (r["status"], r["judgment_rationale"])
+        for r in conn.execute(
+            f"SELECT evidence_key, kind, status, judgment_rationale FROM findings "
+            f"WHERE kind IN ({','.join('?' * len(SPEC_FINDING_KINDS))}) "
+            f"AND status = 'dismissed' AND evidence_key IS NOT NULL",
+            SPEC_FINDING_KINDS,
+        ).fetchall()
+    }
+
     _clear_spec_findings(conn)
 
     # union(class TOC numbers) -> {number: (title, toc_page, representative_volume_id)}
@@ -576,6 +590,17 @@ def compute_project_findings(
     _detect_duplicate_section_numbers(conn)
     _detect_incomplete_placeholders(conn)
     _reconcile_and_gate(conn)
+
+    # Re-apply preserved dismiss judgments last, after every other status
+    # write above — a Reviewer's dismissal always wins over a freshly
+    # recomputed verdict for the same (evidence_key, kind).
+    if prior_judgments:
+        for (evidence_key, kind), (status, rationale) in prior_judgments.items():
+            conn.execute(
+                "UPDATE findings SET status = ?, judgment_rationale = ? "
+                "WHERE evidence_key = ? AND kind = ?",
+                (status, rationale, evidence_key, kind),
+            )
 
 
 def _reconcile_and_gate(conn: sqlite3.Connection) -> None:

@@ -22,6 +22,7 @@ _SUBJECT_BY_KIND = {
     "sheet_in_set_not_in_index": f"{SUBJECT_PREFIX}:sheet-in-set-not-in-index",
     "sheet_number_mismatch": f"{SUBJECT_PREFIX}:sheet-number-mismatch",
     "duplicate_sheet_number": f"{SUBJECT_PREFIX}:duplicate-sheet-number",
+    "discipline_index_missing": f"{SUBJECT_PREFIX}:discipline-index-missing",
 }
 
 _COMMENT_BY_KIND = {
@@ -29,6 +30,7 @@ _COMMENT_BY_KIND = {
     "sheet_in_set_not_in_index": "UNLISTED: in drawing set but not in index",
     "sheet_number_mismatch": "AVW: index vs title block mismatch",
     "duplicate_sheet_number": "IR: duplicate index entry",
+    "discipline_index_missing": "IR: no index found for this discipline",
 }
 
 
@@ -52,7 +54,24 @@ def sheet_variants(num: str) -> list[str]:
     return out
 
 
-def _comment_for(kind: str, sheet_number: str, source_page: int) -> str:
+def _comment_for(
+    kind: str,
+    sheet_number: str,
+    source_page: int,
+    *,
+    notes: str | None = None,
+    title: str | None = None,
+) -> str:
+    # #85: index-vs-set near-miss variance pairing names both numbers and the
+    # shared title — a generic "sheet {number}" comment would hide which two
+    # numbers the Reviewer is being asked to reconcile.
+    if notes and notes.startswith("index_vs_set_variance:set="):
+        set_number = notes.split("=", 1)[1]
+        title_part = f'; title "{title}"' if title else ""
+        return (
+            f"AVW: index reads {sheet_number}, set sheet is {set_number}"
+            f"{title_part}; p. {source_page}"
+        )
     base = _COMMENT_BY_KIND[kind]
     return f"{base}; sheet {sheet_number}; p. {source_page}"
 
@@ -87,11 +106,12 @@ def build_manifest(
 
     entries: list[dict] = []
     for r in rows:
-        kind = r["kind"]
+        row = dict(r)
+        kind = row["kind"]
         subject = _SUBJECT_BY_KIND[kind]
-        sheet = r["sheet_number"] or ""
-        page = int(r["source_page"] or 1)
-        comment = _comment_for(kind, sheet, page)
+        sheet = row["sheet_number"] or ""
+        page = int(row["source_page"] or 1)
+        comment = _comment_for(kind, sheet, page, notes=row.get("notes"), title=row.get("title"))
         entries.append(
             {
                 "kind": kind,

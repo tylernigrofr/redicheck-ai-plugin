@@ -22,6 +22,42 @@ from qc_core.spec import indexer, queries
 from qc_core.spec.kinds import SPEC_FINDING_KINDS
 
 
+def _feedback_report_main(argv: list[str] | None = None) -> int:
+    from qc_core.feedback_report import main as _main
+
+    return _main(argv)
+
+
+COMMANDS = {
+    "qc-index": lambda argv: qc_index_main(argv),
+    "spec-check": lambda argv: spec_check_main(argv),
+    "spec-check-mcp": lambda argv: spec_check_main(argv),  # deprecated alias (ADR-0012)
+    "drawing-index-qc": lambda argv: drawing_index_main(argv),
+    "door-check": lambda argv: door_check_main(argv),
+    "report-issue": lambda argv: _feedback_report_main(argv),
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch ``python -m qc_core.cli <command> ...`` (docs/agents/dev-mode.md)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        print("usage: python -m qc_core.cli <command> [args...]", file=sys.stderr)
+        print("commands: " + ", ".join(COMMANDS), file=sys.stderr)
+        return 2
+    if argv[0] in ("-h", "--help"):
+        print("usage: python -m qc_core.cli <command> [args...]")
+        print("commands: " + ", ".join(COMMANDS))
+        return 0
+    command, rest = argv[0], argv[1:]
+    handler = COMMANDS.get(command)
+    if handler is None:
+        print(f"unknown command: {command}", file=sys.stderr)
+        print("commands: " + ", ".join(COMMANDS), file=sys.stderr)
+        return 2
+    return handler(rest)
+
+
 # Default reviewer when neither --reviewer nor qc.config.toml supplies one.
 # Interim convenience until per-reviewer config is the norm.
 DEFAULT_REVIEWER = "REDICHECK-TKN"
@@ -1040,3 +1076,7 @@ def drawing_index_main(argv: list[str] | None = None) -> int:
         print()
 
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
