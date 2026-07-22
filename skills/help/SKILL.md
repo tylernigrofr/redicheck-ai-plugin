@@ -44,6 +44,15 @@ Offer `/report-issue` when:
 
 Do **not** offer report-issue for routine "zero findings" unless the Reviewer explicitly expected some.
 
+### Drawing-index manual fallback
+
+`/drawing-index-qc` self-checks coverage (volumes discovered vs. drawing PDFs
+present) and checks for per-Discipline embedded indexes before concluding. On
+a mismatch, 0 discovered volumes, or a whole Discipline showing UNLISTED, it
+drops to manual mode and reads pages by hand rather than trusting an empty or
+clean preview. See the skill's own reflexes and
+[docs/methodology.md](../../docs/methodology.md).
+
 ## Environment
 
 - Venv: `${CLAUDE_PLUGIN_ROOT}/.venv` (managed by SessionStart hook, ADR-0017).
@@ -54,3 +63,4 @@ Do **not** offer report-issue for routine "zero findings" unless the Reviewer ex
 
 - Reviewer onboarding: `docs/onboarding.md`
 - Release / support: `docs/release-process.md`
+- Operating model (Claude runs the check; tool is an accelerator; manual-fallback playbook when the tool under-covers): `docs/methodology.md`

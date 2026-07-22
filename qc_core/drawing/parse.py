@@ -14,13 +14,28 @@ except ImportError as exc:
 from qc_core.drawing.config import DrawingIndexConfig, TitleBlockRect
 
 BOOKMARK_RE = re.compile(
+    # Optional leading digit-led BUILDING prefix "16-" ("16-S101", "2-A101" —
+    # per-building volumes whose sheets share a discipline number across
+    # buildings, #86). Kept INSIDE group 1 so the parsed sheet_number stays
+    # namespaced ("16-S101"): S101 in building 1 and building 16 remain distinct
+    # keys. The prefix is digit-led + hyphen-glued to the letter body, so a
+    # spaced "1 - COVER SHEET" (title, not a sheet) never qualifies.
     # Optional digit-led hyphen segment after the number body: "T24-1 - Title-24"
     # parses as T24-1, not a truncated T24 (#73). The (?![A-Za-z]) guard keeps
     # hyphen-glued titles intact — "A101-2ND FLOOR" still splits as A101 + title.
     # Trailing "(?:\.\d{1,2})?" keeps a `.N` sub-sheet suffix glued to the
     # number body ("A110A.1", "A140A.2" — enlarged/detail sub-sheets, #78)
     # instead of being left dangling for the title-split group to swallow.
-    r"^([A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,3}(?![A-Za-z]))?[a-z]{0,4}(?:\.\d{1,2})?)(?:\s*[-–]\s*(.+))?",
+    # Optional leading LETTER-prefix segment "(?:[A-Z]{1,4}-)?" for shared /
+    # typical-detail shapes whose body is itself letter-led ("D-S201", "G-S101"
+    # — detail-structural / general-structural sheets bound into building
+    # volumes, #89). The full key is preserved ("D-S201") and building_prefix
+    # stays NULL (the segment is letter-led, not the digit-led building
+    # namespace). It only engages when a letter body follows, so digit-led
+    # bodies ("E-101", "A101-2ND FLOOR", "T24-1") backtrack it to empty and are
+    # unchanged; the mandatory "[\d\.]+" still rejects letter-only titles
+    # ("CD-SET NOTES").
+    r"^((?:\d{1,2}-)?(?:[A-Z]{1,4}-)?[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,3}(?![A-Za-z]))?[a-z]{0,4}(?:\.\d{1,2})?)(?:\s*[-–]\s*(.+))?",
     re.IGNORECASE,
 )
 # Bookmark `<NUMBER> - <TITLE>` delimiter: hyphen/en-dash with whitespace on
@@ -32,9 +47,21 @@ _BOOKMARK_DELIM_RE = re.compile(r"\s[-–]\s")
 # (T24-1, A2.1-3) and/or a `.N` sub-sheet suffix (A110A.1, #78), anchored at
 # both ends.
 _BOOKMARK_SHEET_RE = re.compile(
-    r"^[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,4})?[a-z]{0,4}(?:\.\d{1,2})?$",
+    r"^(?:\d{1,2}-)?(?:[A-Z]{1,4}-)?[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,4})?[a-z]{0,4}(?:\.\d{1,2})?$",
     re.IGNORECASE,
 )
+
+# Building-prefix namespace segment ("16-S101" → "16"). Digit-led + hyphen,
+# immediately followed by the letter-led discipline body (#86). Extracted as a
+# parsed field so downstream consumers (#89/#90/#93) can read the namespace
+# without re-parsing the key.
+_BUILDING_PREFIX_RE = re.compile(r"^(\d{1,2})-(?=[A-Za-z])")
+
+
+def building_prefix(sheet_number: str) -> str | None:
+    """The building-namespace segment of a sheet key ("16-S101" → "16"), else None."""
+    m = _BUILDING_PREFIX_RE.match(sheet_number or "")
+    return m.group(1) if m else None
 
 
 def _split_bookmark(text: str) -> tuple[str, str] | None:
@@ -74,7 +101,12 @@ SHEET_TOKEN_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_SHEET_PREFIX_RE = re.compile(r"^([A-Z]{1,4})")
+# Discipline prefix, skipping an optional building-namespace segment so
+# "16-S101" and normalized "16S101" both yield discipline prefix "S" (#86).
+# The hyphen is optional to cover normalize_sheet_number output, which collapses
+# it. Non-prefixed keys ("S101") are unaffected — the digit group is optional
+# and sheet numbers are always letter-led once the building segment is stripped.
+_SHEET_PREFIX_RE = re.compile(r"^(?:\d{1,2}-?)?([A-Z]{1,4})")
 
 # Bookmarks and raw index text produced by some firms include a space between
 # the discipline prefix and the sheet number — e.g. "E. 000", "EP. 100",
@@ -113,7 +145,9 @@ def _is_plausible_sheet_token(token: str) -> bool:
         return False
     if sn.count(".") > 2:
         return False
-    return bool(re.match(r"^[A-Z]", sn))
+    # Allow an optional digit-led building-prefix segment ("1-S101", "16-M101")
+    # before the letter-led body (#88); non-prefixed keys are unaffected.
+    return bool(re.match(r"^(?:\d{1,2}-)?[A-Z]", sn))
 
 
 def extract_bookmarks(
@@ -157,6 +191,7 @@ def extract_bookmarks(
                 "title": split[1],
                 "page": int(page),
                 "confidence": "high",
+                "building_prefix": building_prefix(split[0]),
             }
         )
     rate = (len(parsed) / depth2) if depth2 else 0.0
@@ -317,6 +352,15 @@ def find_all_index_pages(
 # FR5210.ECD still can't parse (see #23): form 1 rejects the 3-letter suffix,
 # and form 2 requires the prefix to butt straight against the dot.
 _SHEET_CORE = (
+    # Optional leading digit-led BUILDING prefix ("1-", "16-") and/or letter-led
+    # detail/shared prefix ("D-", "G-"), mirroring BOOKMARK_RE (#86 commit
+    # 7d88c3b, #89 commit a3866de). The index-page TEXT grammar never got these
+    # (they landed on the bookmark grammar only), so building-namespaced index
+    # rows ("1-G000", "16-S101", "D-S201") parsed to zero across the whole
+    # Valrico set (#88/#93). Both segments are optional and the body stays
+    # letter-led, so a digit-led body ("E-101", "E-1-01", "T24-1") backtracks
+    # the letter-prefix to empty and non-prefixed keys ("S101") are unchanged.
+    r"(?:\d{1,2}-)?(?:[A-Z]{1,4}-)?"
     r"(?:"
     r"[A-Z]{1,4}-?\d{1,4}(?:[A-Za-z]{0,4}|\.(?:\d[A-Za-z0-9]{0,3}|[A-Za-z]{1,2})(?:\.(?:\d{1,3}|[A-Za-z]{1,2}))?)"
     r"|[A-Z]{1,4}\.\d{1,4}[A-Za-z]{0,3}"
@@ -356,6 +400,12 @@ def _inline_row(line: str):
     if not m:
         return None
     token = m.group(1).upper()
+    # A building-namespaced token ("1-M151") is strong evidence of a real sheet,
+    # not a unit-type legend ("A1 STANDARD KING STUDIO"), so it bypasses the
+    # shallow single-letter-prefix guard even though its discipline letter is
+    # length-1 (#88).
+    if building_prefix(token):
+        return token, m.group(2).strip()
     pm = _SHEET_PREFIX_RE.match(token)
     prefix = pm.group(1) if pm else ""
     if len(prefix) < 2 and token.count(".") < 2:
@@ -977,6 +1027,131 @@ def _per_prefix_gate(
     ]
 
 
+def _lead_sheet_at_page(sheets: list[dict], page: int) -> str | None:
+    """Bookmark sheet number bound at ``page`` (the index region's lead sheet)."""
+    for s in sheets:
+        if s.get("page") == page:
+            return s["sheet_number"]
+    return None
+
+
+def _discipline_prefix(sheet_number: str) -> str | None:
+    m = _SHEET_PREFIX_RE.match(sheet_number or "")
+    return m.group(1).upper() if m else None
+
+
+def build_index_layers(
+    regions: list[dict],
+    sheets: list[dict],
+    project_bookmark_prefixes: set[str] | None,
+) -> list[dict]:
+    """Classify each index region into a named layer (ADR-0026 / #88).
+
+    One channel per discovered index layer, provenance-named by CONTEXT.md's
+    two domain terms only:
+      - ``master:<lead-sheet>``     — a general/cover-sheet index spanning >= 2
+        disciplines (the whole-volume Master Index), auto-admitted.
+      - ``discipline:<lead-sheet>`` — a single-discipline index on that
+        discipline's lead sheet, admitted only after a Claude page read
+        (confirmation_status='candidate').
+
+    Rows are filtered to those whose discipline prefix is a real project prefix
+    (drops finish/legend code noise) — deliberately NOT the strict per-prefix
+    coverage gate, so a mis-bound master whose listed sheets are absent from its
+    own volume (Valrico B16: index lists 16-S101, bound sheets are 6-S101…)
+    survives as a candidate layer instead of being silently discarded.
+    """
+    layers: list[dict] = []
+    used_prov: set[str] = set()
+    for region in regions:
+        header_pg = region["header_pg"]
+        rows = region["rows"]
+        page_of = region["page_of"]
+        filtered = [
+            r
+            for r in rows
+            if (dp := _discipline_prefix(r["sheet_number"]))
+            and (project_bookmark_prefixes is None or dp in project_bookmark_prefixes)
+        ]
+        from collections import Counter
+
+        disc_counts = Counter(
+            dp for r in filtered if (dp := _discipline_prefix(r["sheet_number"]))
+        )
+        if not filtered or not disc_counts:
+            continue
+        dominant, dominant_ct = disc_counts.most_common(1)[0]
+        # A discipline carries a real sub-section only if it has >= 2 rows; single
+        # cross-discipline tokens (an "A2"/"D600"/"T1" legend/detail token on an
+        # electrical index) are noise, not a sub-index. A region is a Master/cover
+        # index only when >= 2 disciplines each clear that floor (even a garage
+        # cover listing 1-2 sheets across disciplines — Valrico B16 has A/M/P x2);
+        # otherwise it is a single-discipline Discipline Index.
+        significant = [d for d, ct in disc_counts.items() if ct >= 2]
+        lead = _lead_sheet_at_page(sheets, header_pg)
+        # A Master Index lives on the general/cover sheet (G-prefixed lead:
+        # x-G001 residential, x-G000 garage) and spans several disciplines. A
+        # combined discipline index (some firms list Electrical + Technology
+        # together on the E lead sheet) also spans >= 2 disciplines but is NOT a
+        # master — its lead is a discipline sheet. Require a G lead (or, absent a
+        # bookmark lead, >= 3 significant disciplines) to admit a master.
+        is_general_lead = lead is not None and _discipline_prefix(lead) == "G"
+        is_master = len(significant) >= 2 and (
+            is_general_lead or (lead is None and len(significant) >= 3)
+        )
+        if not is_master:
+            kind = "discipline"
+            base = lead or f"p{header_pg}"
+            status = "candidate"
+            disc_prefix = dominant
+            disciplines = {dominant}
+        else:
+            kind = "master"
+            base = lead or f"cover-p{header_pg}"
+            status = "admitted"
+            disc_prefix = None
+            disciplines = set(disc_counts)
+        prov = f"{kind}:{base}"
+        if prov in used_prov:
+            prov = f"{prov}@p{header_pg}"
+        used_prov.add(prov)
+        # A discipline layer carries only its own discipline's rows; a couple of
+        # foreign noise tokens are not part of that Discipline Index.
+        layer_rows = (
+            filtered
+            if kind == "master"
+            else [
+                r
+                for r in filtered
+                if _discipline_prefix(r["sheet_number"]) == disc_prefix
+            ]
+        )
+        layers.append(
+            {
+                "provenance": prov,
+                "layer_kind": kind,
+                "lead_sheet_number": lead,
+                "index_page": header_pg,
+                "discipline_prefix": disc_prefix,
+                "confirmation_status": status,
+                "signals": {
+                    "index_header_page": header_pg,
+                    "disciplines": sorted(disciplines),
+                    "row_count": len(layer_rows),
+                },
+                "entries": [
+                    {
+                        "sheet_number": r["sheet_number"],
+                        "title": r.get("title"),
+                        "index_page": page_of.get(r["sheet_number"], header_pg),
+                    }
+                    for r in layer_rows
+                ],
+            }
+        )
+    return layers
+
+
 def analyze_pdf(
     pdf_path: str | Path,
     *,
@@ -1016,6 +1191,9 @@ def analyze_pdf(
         region_anomalies_all: list[dict] = []
         all_region_pages: list[int] = []
         index_duplicates: list[dict] = []
+        # Per-region raw capture for the layer model (#88), independent of the
+        # strict per-prefix gate below.
+        regions_captured: list[dict] = []
 
         for header_pg in all_header_pages:
             if header_pg in covered_pages:
@@ -1050,6 +1228,14 @@ def analyze_pdf(
                 # listing a key, which is normal, not a duplicate).
                 for dup_key, count in parse_index_page_duplicates(txt).items():
                     page_dup_counts[dup_key] = (count, p)
+
+            regions_captured.append(
+                {
+                    "header_pg": header_pg,
+                    "rows": list(region_raw),
+                    "page_of": dict(region_page_of),
+                }
+            )
 
             # Per-prefix gate: keep only rows from accepted prefixes.
             filtered = _per_prefix_gate(
@@ -1149,6 +1335,38 @@ def analyze_pdf(
             # can still scrape a junk row or two).
             index_rows_parsed = len(index_entries)
 
+        # Building-namespaced sets (#86/#88): switch to the per-layer channel
+        # model. Guarded on building_prefix presence so ordinary single-building
+        # / non-namespaced projects keep the exact flat master_index/volume_index
+        # path above unchanged (Embassy/Atlas/QO/Juvenile/Kadlec precision).
+        index_layers: list[dict] = []
+        if any(s.get("building_prefix") for s in sheets):
+            index_layers = build_index_layers(
+                regions_captured, sheets, project_bookmark_prefixes
+            )
+            # Rebuild index_entries as ONE row per (layer, key) so every layer is
+            # its own reconciliation channel (no cross-layer dedup — a key listed
+            # in both master and a discipline index must appear in both channels).
+            # `source` carries the provenance so the drawing_index_entries
+            # UNIQUE(volume, sheet, source) admits the same key in several layers
+            # (a key listed in both master and a discipline index). The
+            # layer_kind lives in drawing_index_layers; legacy source-keyed
+            # reconciliation is skipped for building sets.
+            index_entries = []
+            for layer in index_layers:
+                for e in layer["entries"]:
+                    index_entries.append(
+                        {
+                            "sheet_number": e["sheet_number"],
+                            "title": e.get("title"),
+                            "source": layer["provenance"],
+                            "index_page": e.get("index_page"),
+                            "layer_provenance": layer["provenance"],
+                        }
+                    )
+            index_pages = sorted({lyr["index_page"] for lyr in index_layers})
+            index_rows_parsed = len(index_entries)
+
         tb_mismatches: list[dict] = []
         if cfg.title_block_calibrated and sheets:
             tb_mismatches = titleblock_crosscheck(doc, sheets, cfg.title_block)
@@ -1157,6 +1375,7 @@ def analyze_pdf(
             "success": True,
             "sheets": sheets,
             "index_entries": index_entries,
+            "index_layers": index_layers,
             "index_duplicates": index_duplicates,
             "titleblock_mismatches": tb_mismatches,
             "bookmark_anomalies": bookmark_anomalies,

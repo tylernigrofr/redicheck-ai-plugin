@@ -223,12 +223,28 @@ def index_drawing_pdf(
     discipline = _discipline_from_filename(path)
     extraction_signal = _json.dumps(meta.get("extraction_signal") or {})
 
+    # Preserve prior discipline-index confirmation decisions across reindex
+    # (ADR-0024 Resolutions persist — an unchanged set never re-asks the
+    # page-read question). Keyed by provenance for this volume.
+    prior_layer_status: dict[str, tuple[str, str | None]] = {}
+    if existing:
+        for r in conn.execute(
+            "SELECT provenance, confirmation_status, rationale "
+            "FROM drawing_index_layers WHERE volume_id = ?",
+            (existing["id"],),
+        ).fetchall():
+            prior_layer_status[r["provenance"]] = (
+                r["confirmation_status"],
+                r["rationale"],
+            )
+
     if existing:
         volume_id = existing["id"]
         conn.execute("DELETE FROM drawing_sheets WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM drawing_index_entries WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM drawing_parse_anomalies WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM drawing_index_duplicates WHERE volume_id = ?", (volume_id,))
+        conn.execute("DELETE FROM drawing_index_layers WHERE volume_id = ?", (volume_id,))
         conn.execute(
             """
             UPDATE drawing_volumes
@@ -259,8 +275,9 @@ def index_drawing_pdf(
         conn.execute(
             """
             INSERT INTO drawing_sheets (
-                volume_id, sheet_number, title, page, confidence, discipline
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                volume_id, sheet_number, title, page, confidence, discipline,
+                building_prefix
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 volume_id,
@@ -269,6 +286,7 @@ def index_drawing_pdf(
                 sheet["page"],
                 sheet.get("confidence"),
                 inf.discipline,
+                sheet.get("building_prefix"),
             ),
         )
 
@@ -276,8 +294,8 @@ def index_drawing_pdf(
         conn.execute(
             """
             INSERT INTO drawing_index_entries (
-                volume_id, sheet_number, title, source, index_page
-            ) VALUES (?, ?, ?, ?, ?)
+                volume_id, sheet_number, title, source, index_page, layer_provenance
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 volume_id,
@@ -285,6 +303,35 @@ def index_drawing_pdf(
                 entry.get("title"),
                 entry["source"],
                 entry.get("index_page"),
+                entry.get("layer_provenance"),
+            ),
+        )
+
+    for layer in result.get("index_layers", []):
+        prov = layer["provenance"]
+        # A confirmed decision (admitted/rejected) on this provenance persists;
+        # a still-candidate layer keeps rescanning as candidate.
+        status = layer["confirmation_status"]
+        rationale = None
+        if prov in prior_layer_status and prior_layer_status[prov][0] != "candidate":
+            status, rationale = prior_layer_status[prov]
+        conn.execute(
+            """
+            INSERT INTO drawing_index_layers (
+                volume_id, layer_kind, provenance, lead_sheet_number,
+                index_page, discipline_prefix, confirmation_status, signals, rationale
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                volume_id,
+                layer["layer_kind"],
+                prov,
+                layer.get("lead_sheet_number"),
+                layer.get("index_page"),
+                layer.get("discipline_prefix"),
+                status,
+                _json.dumps(layer.get("signals") or {}),
+                rationale,
             ),
         )
 
@@ -542,6 +589,169 @@ def _emit_discipline_index_missing_findings(conn: sqlite3.Connection) -> None:
         )
 
 
+def _building_set(conn: sqlite3.Connection) -> bool:
+    """True when this project uses the #88 per-layer index-channel model."""
+    return (
+        conn.execute("SELECT 1 FROM drawing_index_layers LIMIT 1").fetchone()
+        is not None
+    )
+
+
+def _reconcile_layers(
+    conn: sqlite3.Connection,
+    sheets_by_volume: dict[int, dict[str, dict]],
+) -> None:
+    """Per-layer reconciliation for building-namespaced sets (ADR-0026 / #88).
+
+    Each admitted/candidate index layer is reconciled INDEPENDENTLY against its
+    own volume's bookmarks — no cross-layer union, so a master that omits a
+    sheet its discipline index carries surfaces as UNLISTED-against-master
+    (the reason #88 exists). Rejected layers are skipped entirely (expunged).
+
+    Findings from a still-`candidate` discipline layer are held at
+    status='evidence' behind a tripped `discipline_index_unconfirmed` invariant
+    (scoped to the layer provenance): a false channel poisons nothing until a
+    Claude page read admits it. A key is never flagged UNLISTED against a layer
+    for a discipline that layer does not carry at all (so a master that omits an
+    entire discipline — Valrico Technology — does not flood).
+    """
+    from qc_core.drawing.matrix import CHECK_NAME
+    from qc_core.drawing.parse import _SHEET_PREFIX_RE
+
+    def _disc(sn: str) -> str | None:
+        m = _SHEET_PREFIX_RE.match(sn or "")
+        return m.group(1).upper() if m else None
+
+    layers = conn.execute(
+        "SELECT id, volume_id, layer_kind, provenance, confirmation_status "
+        "FROM drawing_index_layers ORDER BY volume_id, provenance"
+    ).fetchall()
+
+    entries_by_layer: dict[tuple[int, str], list[dict]] = {}
+    for row in conn.execute(
+        "SELECT volume_id, sheet_number, title, index_page, layer_provenance "
+        "FROM drawing_index_entries WHERE layer_provenance IS NOT NULL"
+    ).fetchall():
+        entries_by_layer.setdefault(
+            (row["volume_id"], row["layer_provenance"]), []
+        ).append(dict(row))
+
+    # The unconfirmed-layer gate is recomputed every run from the layers'
+    # confirmation_status (the durable decision lives in drawing_index_layers,
+    # not the invariant). Clear stale tripped rows; re-trip only still-candidate
+    # layers below.
+    conn.execute(
+        "DELETE FROM invariant_results WHERE check_name = ? "
+        "AND invariant = 'discipline_index_unconfirmed'",
+        (CHECK_NAME,),
+    )
+
+    candidate_provenances: list[str] = []
+
+    for layer in layers:
+        if layer["confirmation_status"] == "rejected":
+            continue
+        vol_id = layer["volume_id"]
+        prov = layer["provenance"]
+        entries = entries_by_layer.get((vol_id, prov), [])
+        if not entries:
+            continue
+        if layer["confirmation_status"] == "candidate":
+            candidate_provenances.append(prov)
+
+        vol_sheets = sheets_by_volume.get(vol_id, {})
+        vol_keys = set(vol_sheets.keys())
+        layer_keys = {normalize_sheet_number(e["sheet_number"]): e for e in entries}
+        covered_disc = {_disc(e["sheet_number"]) for e in entries}
+        covered_disc.discard(None)
+
+        # CNL: listed in this layer, absent from this volume's bound sheets.
+        for key, e in layer_keys.items():
+            if not _index_covers(key, vol_keys):
+                _insert_finding(
+                    conn,
+                    kind="sheet_in_index_not_in_set",
+                    sheet_number=e["sheet_number"],
+                    drawing_volume_id=vol_id,
+                    title=e.get("title"),
+                    source_page=e.get("index_page"),
+                    notes=prov,
+                )
+        # UNLISTED: bound sheet of a discipline this layer carries, but absent
+        # from the layer. Disciplines the layer omits entirely are out of scope.
+        for key, row in vol_sheets.items():
+            if _disc(row["sheet_number"]) not in covered_disc:
+                continue
+            if not _index_covers(key, set(layer_keys.keys())):
+                _insert_finding(
+                    conn,
+                    kind="sheet_in_set_not_in_index",
+                    sheet_number=row["sheet_number"],
+                    drawing_volume_id=vol_id,
+                    source_page=row["page"],
+                    notes=prov,
+                )
+        _flag_duplicates_layer(conn, entries, vol_id, prov)
+
+    # Hold candidate-layer findings at Evidence + trip the unconfirmed invariant.
+    for prov in candidate_provenances:
+        held = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM findings WHERE notes = ? AND kind IN "
+                "('sheet_in_index_not_in_set', 'sheet_in_set_not_in_index', "
+                "'duplicate_sheet_number')",
+                (prov,),
+            ).fetchall()
+        ]
+        if held:
+            marks = ",".join("?" * len(held))
+            conn.execute(
+                f"UPDATE findings SET status = 'evidence' WHERE id IN ({marks})",
+                held,
+            )
+        detail = {
+            "provenance": prov,
+            "held_findings": len(held),
+            "note": (
+                "Deterministic discipline-index candidate. MANDATORY page read: "
+                "open the lead sheet, confirm this is a real Discipline Index, "
+                "then admit/reject via --apply-judgments channels[] before its "
+                "findings can emit (ADR-0026)."
+            ),
+        }
+        import json as _json
+
+        conn.execute(
+            "INSERT OR REPLACE INTO invariant_results "
+            "(check_name, invariant, scope, status, detail) "
+            "VALUES (?, 'discipline_index_unconfirmed', ?, 'tripped', ?)",
+            (CHECK_NAME, prov, _json.dumps(detail)),
+        )
+
+
+def _flag_duplicates_layer(
+    conn: sqlite3.Connection, entries: list[dict], vol_id: int, prov: str
+) -> None:
+    counts: dict[str, int] = {}
+    by_key: dict[str, dict] = {}
+    for e in entries:
+        key = normalize_sheet_number(e["sheet_number"])
+        counts[key] = counts.get(key, 0) + 1
+        by_key.setdefault(key, e)
+    for key, count in counts.items():
+        if count > 1:
+            e = by_key[key]
+            _insert_finding(
+                conn,
+                kind="duplicate_sheet_number",
+                sheet_number=e["sheet_number"],
+                drawing_volume_id=vol_id,
+                source_page=e.get("index_page"),
+                notes=f"{prov} x{count}",
+            )
+
+
 def compute_drawing_findings(conn: sqlite3.Connection) -> None:
     """Project-level cross-ref: index vs bookmark catalog (ADR-0014).
 
@@ -691,6 +901,14 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
             )
     project_prefixes = _prefixes(row["sheet_number"] for row in project_set.values())
 
+    # #88: building-namespaced sets use the per-layer channel reconciliation
+    # (each index layer its own channel); the flat master/volume legacy blocks
+    # below are skipped for them so their outcomes are provably unchanged on
+    # non-namespaced fixtures (Embassy/Atlas/QO/Juvenile/Kadlec).
+    building = _building_set(conn)
+    if building:
+        _reconcile_layers(conn, sheets_by_volume)
+
     master_entries: list[dict] = []
     for (vol_id, source), entries in entries_by_volume_source.items():
         if source == "master_index":
@@ -725,7 +943,7 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
 
     flagged_master_missing: set[str] = set()
     flagged_master_extra: set[str] = set()
-    if master_entries:
+    if master_entries and not building:
         master_vol_id = master_entries[0]["volume_id"]
         master_keys = {normalize_sheet_number(e["sheet_number"]) for e in master_entries}
         set_keys = set(project_set.keys())
@@ -803,7 +1021,7 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
     from qc_core.drawing.parse import _SHEET_PREFIX_RE
 
     for (vol_id, source), entries in entries_by_volume_source.items():
-        if source != "volume_index":
+        if source != "volume_index" or building:
             continue
         vol_sheets = sheets_by_volume.get(vol_id, {})
         vol_keys = set(vol_sheets.keys())
@@ -849,7 +1067,7 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
     # volume_index both exist, the volume_index defines the authoritative sheet
     # list for its discipline(s); divergences are flagged against the master so
     # an accurate sub-index doesn't suppress a stale master entry.
-    if master_entries:
+    if master_entries and not building:
         master_vol_id = master_entries[0]["volume_id"]
         master_by_key = {
             normalize_sheet_number(e["sheet_number"]): e for e in master_entries

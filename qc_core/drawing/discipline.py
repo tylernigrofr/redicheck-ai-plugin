@@ -262,6 +262,9 @@ def infer_sheet_discipline(
     volume_discipline_hint: str | None = None,
 ) -> SheetDisciplineResult:
     sn = (sheet_number or "").strip().upper().replace(" ", "")
+    # Strip a leading building-namespace segment ("16-S101" → "S101", #86) so
+    # discipline inference reads the discipline prefix, not the building digits.
+    sn = re.sub(r"^\d{1,2}-(?=[A-Z])", "", sn)
     vc = normalize_volume_hint(volume_discipline_hint)
 
     if not sn:

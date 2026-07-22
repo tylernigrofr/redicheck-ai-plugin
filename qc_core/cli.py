@@ -8,7 +8,7 @@ import tomllib
 from collections import defaultdict
 from pathlib import Path
 
-from qc_core.discovery import qc_sqlite_path
+from qc_core.discovery import discover_all_pdfs, qc_sqlite_path
 from qc_core.drawing.kinds import DRAWING_FINDING_KINDS
 from qc_core.drawing import emit as drawing_emit
 from qc_core.drawing import indexer as drawing_indexer
@@ -127,6 +127,24 @@ def _run_qc_index(project_folder: str | Path, *, force: bool = False) -> int:
             )
     for s in [x for x in drawing_summaries if not x.get("indexed")]:
         print(f"  drawing skipped volume {s.get('volume_id')}: {s.get('reason')}")
+
+    discovery = discover_all_pdfs(project_folder)
+    print(
+        f"discovery: {discovery.spec_count} spec / {discovery.drawing_count} drawing / "
+        f"{len(discovery.other)} other"
+    )
+    for entry in discovery.other:
+        print(f"  other: {entry.path.name} — {entry.reason}")
+
+    if discovery.other and discovery.drawing_count == 0:
+        print()
+        print("!! UNTRUSTED SCOPE (ADR-0026) — possible drawing coverage gap:")
+        print(
+            f"  {len(discovery.other)} non-spec PDF(s) classified 'other' and "
+            "0 drawing volumes discovered — indexing may have silently skipped "
+            "real drawing content."
+        )
+        print("  Review the 'other' filenames above before treating this run as clean.\n")
 
     return 0
 
@@ -582,6 +600,8 @@ def _drawing_matrix_report(conn) -> int:
         "pending_evidence": drawing_matrix.pending_evidence(conn),
         "disputed_rows": drawing_matrix.disputed_rows(conn),
         "scoreboard": drawing_matrix.compute_scoreboard(conn),
+        "prefix_facts": drawing_matrix.prefix_facts(conn),
+        "discipline_index_candidates": drawing_matrix.discipline_index_candidates(conn),
     }
     print(_json.dumps(report, indent=2))
     return 0

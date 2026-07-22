@@ -41,6 +41,101 @@ So **apply your own judgment and do not trust the tool 100%**:
   Diagnose the gap (per-volume `extraction_signal`, `--show-index`,
   `--show-bookmarks`, `--explain`) before reporting numbers.
 
+## Coverage self-check
+
+After `qc-index`, assert **#drawing volumes discovered == #drawing PDFs in the
+project folder**. On 0 discovered volumes or any mismatch, drop to manual mode
+and say so — never report an empty or clean preview as a passed check; an
+empty result here means discovery failed, not that the set is clean. See the
+manual-fallback playbook in [docs/methodology.md](../../docs/methodology.md).
+
+## Index-layer checklist
+
+Before concluding a review, check for per-Discipline embedded indexes — a
+Discipline Index carried on that Discipline's lead sheet (e.g. `x-M000`,
+`x-E001`, `x-T001`) — not just the Master Index (see CONTEXT.md). **An entire
+Discipline showing as UNLISTED is a signal that Discipline has its own index**
+the tool never reconciled against. That signal is a **mandatory page read**:
+open the lead sheet and read the Discipline Index yourself before judging
+those findings — never resolve on the raw UNLISTED count alone (per the 1300 W
+218th post-mortem: resolving invariants without opening the PDF produced 9/10
+false findings). See [docs/methodology.md](../../docs/methodology.md) for the
+full manual-fallback playbook.
+
+## Building-prefix facts (multi-building sets)
+
+On sets with per-building volumes whose sheets carry a building namespace
+(`16-S101`, `2-A101` — #86), `--mode=matrix` includes a `prefix_facts` list.
+These are **cheap structural facts, not verdicts** — qc_core states what the
+prefixes are; the mis-bind-vs-shared-detail-vs-noise call is yours. The list is
+empty on ordinary single-building sets. Two fact kinds:
+
+- `sheet_building_prefix_foreign_to_volume` — a sheet whose building namespace
+  differs from its volume's dominant one (e.g. `6-S101` inside the Building 16
+  volume). **A mis-bind candidate — but not automatically a finding.** It is
+  equally a sheet deliberately shared into the volume or a parse artifact. Open
+  the page (`volume_id`/`pdf_path`/`pages` are in the fact): if the sheet
+  genuinely belongs to another building's set and was bound here by mistake,
+  that is a real Candidate; judge it as the reconciliation finding it already
+  surfaces as (typically UNLISTED in this volume — `sheet_in_set_not_in_index`),
+  citing the foreign-prefix fact in your rationale. There is **no dedicated
+  mis-bind kind**; reuse the existing kind and carry the fact in the rationale
+  (ADR-0025 groups by `<skill>:<kind>` Subject, which the reused kind already
+  provides). Caveat: "dominant" is the sheet-count mode, so when mis-bound
+  sheets outnumber the volume's native ones the fact reports the *native*
+  prefix as foreign — read the volume filename and the pages before deciding
+  which direction the mis-bind runs.
+- `nonbuilding_prefix_across_building_volumes` — a non-building-namespaced
+  prefix (`D-`, `G-`, `WD`…) recurring across several building volumes. This is
+  the **shared/typical-detail** convention (detail sheets bound identically into
+  every building). **Dedupe it as one convention — do not emit a finding per
+  sheet.** Confirm on one page that it is a shared detail series, note the
+  convention once, and move on. Only escalate if a specific sheet in the series
+  is genuinely missing where it should appear.
+
+## Discipline-index confirmation (multi-layer sets, #88)
+
+On building-namespaced sets each discovered index layer is its own
+Reconciliation Matrix channel, provenance-named by CONTEXT.md's two domain
+terms: `master:1-G001` (a general/cover-sheet index for a whole volume) and
+`discipline:1-M000` (a single-discipline index on that discipline's lead
+sheet). No layer is ranked authoritative in code — which layer is wrong (e.g. a
+systematically incomplete master that omits unit-level M/P sheets its discipline
+index carries) is your judgment across rows.
+
+Master layers are auto-admitted. **Every Discipline Index layer is a
+deterministic candidate that MUST be confirmed by a page read before its channel
+is admitted** — a false channel (a schedule page mis-read as an index) would
+poison every matrix row set-wide. `--mode=matrix` lists them under
+`discipline_index_candidates` (provenance, `pdf_path`, `index_page`,
+`lead_sheet_number`, `discipline_prefix`, and the `would_flag` findings held
+pending your call). Until admitted, those findings sit at `status=evidence`
+behind a tripped `discipline_index_unconfirmed` invariant and cannot emit.
+
+Open the lead sheet, confirm it is a real Discipline Index, then record the
+decision in the `--apply-judgments` file's `channels` array:
+
+```json
+{
+  "channels": [
+    {"provenance": "discipline:1-T001", "action": "admit",
+     "rationale": "read pg 71: 'TECHNOLOGY SHEET INDEX' table, confirmed"},
+    {"provenance": "discipline:2-M000", "action": "reject",
+     "rationale": "pg 3 is a mechanical schedule mis-detected as an index"}
+  ]
+}
+```
+
+**admit** promotes the layer's held findings to Candidates and clears its gate.
+**reject** expunges the channel entirely — its matrix rows and findings are
+removed as if it never existed. Both decisions persist across reindex (ADR-0024),
+so an unchanged Drawing Set never re-asks.
+
+Odd or unexpected prefixes surface here too (rather than being silently lost);
+treat an unfamiliar recurring prefix as a page-read prompt, not a finding. A
+sheet number that fails the grammar entirely still arrives as a `parse_anomaly`
+(e.g. `WD1`-class oddities), governed by the dismissal discipline below.
+
 ## Usage
 
 Always invoke through the plugin venv — never rely on PATH resolution.
@@ -77,7 +172,7 @@ Default `--mode=preview`. The flip to `emit` is deferred — see [precision-thre
 
 - Auto-runs `qc-index` when `qc.sqlite` is missing or stale (spec or drawing PDFs).
 - **preview**: prints the per-prefix scoreboard (index/bookmark/reconciled/disputed/anomaly counts, with `!` flag on zero-reconciled rows) followed by drawing findings grouped by `kind` from `qc.sqlite`. Shows an UNTRUSTED SCOPE banner when invariants are tripped or Evidence is pending.
-- **matrix**: prints the judgment-node worklist as JSON — tripped invariants, findings at `status=evidence`, disputed reconciliation-matrix rows, and the scoreboard (ADR-0026).
+- **matrix**: prints the judgment-node worklist as JSON — tripped invariants, findings at `status=evidence`, disputed reconciliation-matrix rows, the scoreboard, and `prefix_facts` (building-prefix structural facts on multi-building sets; see below) (ADR-0026).
 - **sweep**: completeness sweep worklist — scoreboard for all prefixes + full raw side-by-side dumps (index rows raw→key vs bookmark rows raw→key, page-ordered) for suspicious prefixes only (any parse anomalies, disputed rows, zero-reconciled, or index_count != bookmark_count). Clean prefixes print as one scoreboard line. Supports `--json`. This is the mandatory judgment node before emit (ADR-0027).
 - **emit**: writes one red Revu-style FreeText callout per finding via PyMuPDF (ADR-0012) — the same markup style as spec-check (`qc_core.markup`). Reviewer falls back to `qc.config.toml [reviewer] name`, else the built-in default `REDICHECK-TKN`. Default output is `<name>.marked.pdf`; pass `--in-place` to overwrite sources. **Exits 2 without writing** when any invariant is tripped or any Evidence is unjudged — you cannot sign off on a list with known completeness gaps (ADR-0026 §6a).
 

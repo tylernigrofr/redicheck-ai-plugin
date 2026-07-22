@@ -22,6 +22,13 @@ CHANNEL_BOOKMARKS = "bookmarks"
 CHANNEL_MASTER = "master_index"
 CHANNEL_VOLUME = "volume_index"
 
+
+def _is_index_channel(channel: str) -> bool:
+    """Any channel other than the physical-set bookmark channel is an index
+    layer — the flat legacy master_index/volume_index or a #88 provenance
+    channel (`master:1-G001`, `discipline:1-M000`)."""
+    return channel != CHANNEL_BOOKMARKS
+
 # An invariant trips only past these floors so single-sheet oddities don't
 # mark whole projects untrusted; below the floor the disagreement still
 # surfaces as an ordinary Evidence/finding row.
@@ -78,10 +85,27 @@ def build_matrix(conn: sqlite3.Connection) -> int:
             {"title": row["title"]} if row["title"] else None,
         )
 
+    rejected_layers = {
+        r["provenance"]
+        for r in conn.execute(
+            "SELECT provenance FROM drawing_index_layers WHERE confirmation_status = 'rejected'"
+        ).fetchall()
+    }
     for row in conn.execute(
-        "SELECT volume_id, sheet_number, title, source, index_page FROM drawing_index_entries"
+        "SELECT volume_id, sheet_number, title, source, index_page, layer_provenance "
+        "FROM drawing_index_entries"
     ).fetchall():
-        channel = CHANNEL_MASTER if row["source"] == "master_index" else CHANNEL_VOLUME
+        # #88: a rejected layer is expunged — its rows never enter the matrix,
+        # restoring it exactly as if the channel never existed (directive #3).
+        if row["layer_provenance"] and row["layer_provenance"] in rejected_layers:
+            continue
+        # #88: on building-namespaced sets each index layer is its own channel,
+        # provenance-named (`master:1-G001`, `discipline:1-M000`). Legacy
+        # non-namespaced sets keep the flat master_index/volume_index channels.
+        if row["layer_provenance"]:
+            channel = row["layer_provenance"]
+        else:
+            channel = CHANNEL_MASTER if row["source"] == "master_index" else CHANNEL_VOLUME
         _write(
             normalize_sheet_number(row["sheet_number"]),
             channel,
@@ -144,9 +168,7 @@ def evaluate_invariants(conn: sqlite3.Connection) -> list[dict]:
             except (TypeError, ValueError):
                 pass
 
-    has_any_index = any(
-        r["channel"] in (CHANNEL_MASTER, CHANNEL_VOLUME) for r in matrix
-    )
+    has_any_index = any(_is_index_channel(r["channel"]) for r in matrix)
 
     tripped: list[dict] = []
 
@@ -165,7 +187,10 @@ def evaluate_invariants(conn: sqlite3.Connection) -> list[dict]:
 
     for prefix, chans in sorted(by_prefix_channel.items()):
         sheet_keys = chans.get(CHANNEL_BOOKMARKS, set())
-        index_keys = chans.get(CHANNEL_MASTER, set()) | chans.get(CHANNEL_VOLUME, set())
+        index_keys: set[str] = set()
+        for ch, keys in chans.items():
+            if _is_index_channel(ch):
+                index_keys |= keys
 
         # prefix_absent_from_index: a discipline group physically present in
         # the set with zero index coverage. The #53 silent-drop class: the
@@ -448,7 +473,7 @@ def compute_scoreboard(conn: sqlite3.Connection) -> list[dict]:
 
     # Determine which channels actually exist for the project
     all_channels = {r["channel"] for r in matrix_rows}
-    has_index_channel = bool(all_channels & {CHANNEL_MASTER, CHANNEL_VOLUME})
+    has_index_channel = any(_is_index_channel(c) for c in all_channels)
 
     # Per-prefix anomaly counts (parse_anomaly findings, ADR-0027 / #65)
     anomaly_rows = conn.execute(
@@ -468,7 +493,10 @@ def compute_scoreboard(conn: sqlite3.Connection) -> list[dict]:
     for prefix in sorted(all_prefixes):
         chans = by_prefix.get(prefix, {})
         bookmark_keys = chans.get(CHANNEL_BOOKMARKS, set())
-        index_keys = chans.get(CHANNEL_MASTER, set()) | chans.get(CHANNEL_VOLUME, set())
+        index_keys = set()
+        for ch, keys in chans.items():
+            if _is_index_channel(ch):
+                index_keys |= keys
         reconciled_keys = bookmark_keys & index_keys
         disputed_keys = bookmark_keys.symmetric_difference(index_keys)
         reconciled = len(reconciled_keys)
@@ -489,6 +517,123 @@ def compute_scoreboard(conn: sqlite3.Connection) -> list[dict]:
             }
         )
     return scoreboard
+
+
+def prefix_facts(conn: sqlite3.Connection) -> list[dict]:
+    """Cheap structural building-prefix facts for the judgment node (#89/#90).
+
+    Pure Evidence/diagnostics — NO verdict, NO finding rows, NO suppression,
+    NO mis-bind classifier. Surfaces two prefix patterns that only Claude can
+    judge (mis-bind vs shared/typical-detail vs noise), read from the
+    ``drawing_sheets.building_prefix`` namespace landed by #86. Computed ONLY
+    when the set actually uses building-namespaced sheet numbers (at least one
+    sheet carries a building_prefix); otherwise returns ``[]`` so ordinary
+    single-building projects emit nothing here.
+
+    Two fact kinds, each a dict with a ``fact`` discriminator + provenance,
+    matching the invariant ``detail`` sample-list convention (grouped, not
+    per-sheet, so a systematic convention surfaces as one row not a flood):
+
+    - ``sheet_building_prefix_foreign_to_volume`` (#90): a sheet whose building
+      namespace differs from its volume's dominant one (e.g. ``6-S101`` bound in
+      the Building 16 volume). A mis-bind candidate — but equally a deliberately
+      shared sheet or a parse artifact; the page read decides.
+    - ``nonbuilding_prefix_across_building_volumes`` (#89): a non-building-
+      namespaced discipline prefix recurring across >=2 building-prefixed
+      volumes (``D-``, ``G-``, ``WD``…), i.e. shared/typical-detail sheets. Odd
+      prefixes surface here too rather than being silently lost.
+    """
+    from collections import Counter, defaultdict
+
+    sheets = conn.execute(
+        "SELECT s.volume_id, s.sheet_number, s.building_prefix, s.page, v.pdf_path "
+        "FROM drawing_sheets s JOIN drawing_volumes v ON v.id = s.volume_id"
+    ).fetchall()
+
+    # Guard: only meaningful for building-namespaced sets (#86). No building
+    # prefixes anywhere → nothing to say, stay silent.
+    if not any(r["building_prefix"] for r in sheets):
+        return []
+
+    vol_bp: dict[int, Counter] = defaultdict(Counter)
+    vol_path: dict[int, str] = {}
+    for r in sheets:
+        vol_path[r["volume_id"]] = r["pdf_path"]
+        if r["building_prefix"]:
+            vol_bp[r["volume_id"]][r["building_prefix"]] += 1
+
+    # A volume's dominant building namespace (mode of its building-prefixed
+    # sheets). Volumes with zero building-prefixed sheets have no dominant and
+    # are not treated as building volumes.
+    dominant: dict[int, str] = {
+        vid: ctr.most_common(1)[0][0] for vid, ctr in vol_bp.items()
+    }
+
+    facts: list[dict] = []
+
+    # Fact (a) — sheet building prefix foreign to its volume's dominant (#90).
+    foreign: dict[tuple[int, str], list[tuple[str, int]]] = defaultdict(list)
+    for r in sheets:
+        bp = r["building_prefix"]
+        dom = dominant.get(r["volume_id"])
+        if bp and dom and bp != dom:
+            foreign[(r["volume_id"], bp)].append((r["sheet_number"], r["page"]))
+    for (vid, bp), items in sorted(foreign.items()):
+        items.sort()
+        facts.append(
+            {
+                "fact": "sheet_building_prefix_foreign_to_volume",
+                "volume_id": vid,
+                "pdf_path": vol_path.get(vid),
+                "volume_dominant_building_prefix": dominant.get(vid),
+                "foreign_building_prefix": bp,
+                "sheet_count": len(items),
+                "sheets": [s for s, _ in items][:20],
+                "pages": [p for _, p in items][:20],
+                "note": (
+                    "Sheet(s) carry a building namespace different from this "
+                    "volume's dominant one. Could be a mis-bound sheet, a "
+                    "deliberately shared sheet, or a parse artifact — judge on "
+                    "the page."
+                ),
+            }
+        )
+
+    # Fact (b) — non-building prefix recurring across building volumes (#89).
+    building_volumes = set(dominant)
+    disc: dict[str, dict[int, list[tuple[str, int]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for r in sheets:
+        if r["building_prefix"]:
+            continue  # building-namespaced sheets are Fact (a)'s domain
+        if r["volume_id"] not in building_volumes:
+            continue
+        dp = _prefix_of(r["sheet_number"])
+        if not dp:
+            continue
+        disc[dp][r["volume_id"]].append((r["sheet_number"], r["page"]))
+    for dp, vmap in sorted(disc.items()):
+        if len(vmap) < 2:
+            continue  # not recurring across volumes → not a shared convention
+        all_sheets = sorted({s for items in vmap.values() for s, _ in items})
+        facts.append(
+            {
+                "fact": "nonbuilding_prefix_across_building_volumes",
+                "prefix": dp,
+                "volume_ids": sorted(vmap),
+                "volume_count": len(vmap),
+                "sheet_count": len(all_sheets),
+                "sample": all_sheets[:20],
+                "note": (
+                    "A non-building-namespaced prefix recurring across multiple "
+                    "building volumes — typically shared/typical-detail sheets. "
+                    "Dedupe as one convention; do not emit per-sheet."
+                ),
+            }
+        )
+
+    return facts
 
 
 def sweep_worklist(conn: sqlite3.Connection) -> list[dict]:
@@ -523,9 +668,9 @@ def sweep_worklist(conn: sqlite3.Connection) -> list[dict]:
             "key": row["entity_key"],
             "page": row["page"],
         }
-        if row["channel"] in (CHANNEL_MASTER, CHANNEL_VOLUME):
+        if _is_index_channel(row["channel"]):
             index_by_prefix.setdefault(prefix, []).append(entry)
-        elif row["channel"] == CHANNEL_BOOKMARKS:
+        else:
             bookmark_by_prefix.setdefault(prefix, []).append(entry)
 
     anomaly_rows = conn.execute(
@@ -559,6 +704,47 @@ def sweep_worklist(conn: sqlite3.Connection) -> list[dict]:
             entry["anomaly_rows"] = None
         result.append(entry)
     return result
+
+
+def discipline_index_candidates(conn: sqlite3.Connection) -> list[dict]:
+    """Unconfirmed discipline-index channels awaiting a Claude page read (#88).
+
+    Each is a deterministic candidate: the lead sheet must be opened and read to
+    confirm it is a real Discipline Index before the channel is admitted (its
+    held findings become emittable) or rejected (expunged). Empty on non-building
+    sets and once every candidate is decided.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT l.volume_id, l.provenance, l.lead_sheet_number, l.index_page, "
+            "l.discipline_prefix, l.signals, v.pdf_path "
+            "FROM drawing_index_layers l JOIN drawing_volumes v ON v.id = l.volume_id "
+            "WHERE l.confirmation_status = 'candidate' ORDER BY l.volume_id, l.provenance"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # pre-migration DB
+    out: list[dict] = []
+    for r in rows:
+        held = conn.execute(
+            "SELECT kind, sheet_number FROM findings WHERE notes = ? "
+            "AND status = 'evidence' ORDER BY kind, sheet_number",
+            (r["provenance"],),
+        ).fetchall()
+        out.append(
+            {
+                "provenance": r["provenance"],
+                "volume_id": r["volume_id"],
+                "pdf_path": r["pdf_path"],
+                "lead_sheet_number": r["lead_sheet_number"],
+                "index_page": r["index_page"],
+                "discipline_prefix": r["discipline_prefix"],
+                "signals": json.loads(r["signals"]) if r["signals"] else {},
+                "would_flag": [
+                    {"kind": h["kind"], "sheet_number": h["sheet_number"]} for h in held
+                ],
+            }
+        )
+    return out
 
 
 def all_invariants(conn: sqlite3.Connection) -> list[dict]:
@@ -688,7 +874,42 @@ def apply_judgments(conn: sqlite3.Connection, payload: dict) -> dict:
             + "\n".join(errors)
         )
 
-    applied = {"promoted": 0, "dismissed": 0, "reclassified": 0, "invariants": 0}
+    applied = {
+        "promoted": 0,
+        "dismissed": 0,
+        "reclassified": 0,
+        "invariants": 0,
+        "channels": 0,
+    }
+
+    # --- discipline-index channel admit/reject (#88) ---
+    # A candidate Discipline Index channel is admitted (its held findings become
+    # emittable Candidates) or rejected (expunged as if it never existed) only
+    # after a Claude page read. The durable decision lives in
+    # drawing_index_layers.confirmation_status; the findings/matrix are then
+    # rebuilt so an admit unblocks its scope and a reject removes every trace.
+    channels = payload.get("channels", [])
+    for ch in channels:
+        prov = ch["provenance"]
+        action = ch.get("action")
+        if action not in ("admit", "reject"):
+            raise ValueError(f"Unknown channel action: {action!r}")
+        row = conn.execute(
+            "SELECT id FROM drawing_index_layers WHERE provenance = ?", (prov,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown index layer provenance: {prov!r}")
+        conn.execute(
+            "UPDATE drawing_index_layers SET confirmation_status = ?, rationale = ? "
+            "WHERE provenance = ?",
+            ("admitted" if action == "admit" else "rejected", ch.get("rationale", ""), prov),
+        )
+        applied["channels"] += 1
+    if channels:
+        from qc_core.drawing.indexer import compute_drawing_findings
+
+        compute_drawing_findings(conn)
+
     kind_marks = ",".join("?" * len(DRAWING_FINDING_KINDS))
 
     for dec in decisions:

@@ -56,6 +56,24 @@ REPORT_SUFFIX_RE = re.compile(
 
 
 @dataclass(frozen=True)
+class OtherPdfEntry:
+    """A PDF classified `other` — not a spec or drawing volume (issue #87)."""
+
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class DiscoverySummary:
+    """Per-run PDF discovery counts, surfaced so a silent-skip (Valrico, #87)
+    reads as a visible gap instead of a clean exit."""
+
+    spec_count: int
+    drawing_count: int
+    other: list[OtherPdfEntry]
+
+
+@dataclass(frozen=True)
 class SpecVolumeDiscovery:
     path: Path
     sort_key: tuple
@@ -106,11 +124,21 @@ def _bookmarks_look_like_sheets(path: Path) -> bool:
     discipline-volume filenames (e.g. ``EBM.pdf``, ``Vapor Intrusion.pdf``)
     that the filename heuristics don't anticipate.
 
+    Sheet-shape matching delegates to the shared ``BOOKMARK_RE`` grammar, so
+    building-prefixed volumes (``16-S101 - FOUNDATION PLAN``, #86) — whose
+    digit-led ``\\d{1,2}-`` namespace previously defeated the letter-led grammar
+    and left every per-building PDF classified ``other`` (Valrico: 16 PDFs, 0
+    discovered) — now clear this gate and are correctly classified as drawing
+    sets.
+
     Conservative by design: requires several depth-2 entries and a clear
     majority matching the sheet-number pattern, so report/narrative PDFs with
     a stray sheet-shaped bookmark are not misclassified.
     """
-    # Local import to avoid importing PyMuPDF at module load for filename-only callers.
+    # Local import to avoid importing PyMuPDF at module load for filename-only
+    # callers. BOOKMARK_RE is the single source of truth for sheet-number shape
+    # (including the #86 building prefix), keeping discovery and extraction in
+    # lockstep.
     from qc_core.drawing.parse import BOOKMARK_RE
 
     try:
@@ -187,6 +215,49 @@ def discover_drawing_pdfs(project_folder: str | Path) -> list[DrawingSetDiscover
         )
         for p in pdfs
     ]
+
+
+def _other_pdf_reason(path: Path) -> str:
+    """Explain why a PDF landed in `other`, reusing the existing classifier
+    checks (no second heuristic — per #87 triage decision)."""
+    reasons = []
+    if not SPEC_FILENAME_RE.search(path.name):
+        reasons.append("no spec filename match")
+    if not (
+        BUNDLED_DRAWING_RE.search(path.name)
+        or DISCIPLINE_DRAWING_RE.match(path.name)
+        or NUMBERED_DRAWING_RE.match(path.name)
+    ):
+        reasons.append("no drawing filename pattern match")
+    if not _bookmarks_look_like_sheets(path):
+        reasons.append("bookmarks do not look like sheet numbers")
+    return "; ".join(reasons) if reasons else "unclassified"
+
+
+def discover_all_pdfs(project_folder: str | Path) -> DiscoverySummary:
+    """Classify every PDF in the folder (spec / drawing_set / other) for the
+    per-run discovery summary (#87). Our own `.marked.pdf` emit outputs are
+    excluded entirely, matching the existing discover_* helpers."""
+    root = Path(project_folder)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Project folder not found: {root}")
+    pdfs = sorted(
+        p
+        for p in root.iterdir()
+        if p.is_file() and p.suffix.lower() == ".pdf" and not _is_emit_output(p)
+    )
+    spec_count = 0
+    drawing_count = 0
+    other: list[OtherPdfEntry] = []
+    for p in pdfs:
+        classification = classify_pdf(p)
+        if classification == "spec":
+            spec_count += 1
+        elif classification == "drawing_set":
+            drawing_count += 1
+        else:
+            other.append(OtherPdfEntry(path=p, reason=_other_pdf_reason(p)))
+    return DiscoverySummary(spec_count=spec_count, drawing_count=drawing_count, other=other)
 
 
 def qc_sqlite_path(project_folder: str | Path) -> Path:
