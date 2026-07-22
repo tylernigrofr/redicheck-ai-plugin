@@ -75,7 +75,6 @@ _SUBJECT_BY_KIND = {
     "duplicate_section_number": f"{SUBJECT_PREFIX}:duplicate-section-number",
     "duplicate_section_number_and_name": f"{SUBJECT_PREFIX}:duplicate-section-number-and-name",
     "incomplete_placeholder": f"{SUBJECT_PREFIX}:incomplete-placeholder",
-    "unresolved_option_bracket": f"{SUBJECT_PREFIX}:unresolved-option-bracket",
 }
 _DIVISION_MISSING_SUBJECT = f"{SUBJECT_PREFIX}:division-missing-from-toc"
 
@@ -247,7 +246,7 @@ def build_manifest(
             else:
                 comment = f"CNL section {format_section(r['to_section'], fmt)}"
             if "typical" in tags:
-                comment += " Typical"
+                comment += " (typical)"
             entries.append({
                 "kind": kind,
                 "subject": subject,
@@ -268,7 +267,8 @@ def build_manifest(
                 continue
             anchor_page = _toc_page_of(conn, volume_id, anchor) or _toc_start(conn, volume_id)
             terms = section_variants(anchor)
-            comment = f"CNL section {format_section(missing, fmt)} in TOC"
+            title = r["title"] or ""
+            comment = f"{format_section(missing, fmt)} {title}".strip()
             entries.append({
                 "kind": kind,
                 "subject": subject,
@@ -283,7 +283,7 @@ def build_manifest(
             section = r["section"] or ""
             anchor_page = r["toc_page"] or _toc_start(conn, volume_id)
             terms = section_variants(section)
-            comment = f"CNL section {format_section(section, fmt)} in body"
+            comment = f"CNL section {format_section(section, fmt)}"
             entries.append({
                 "kind": kind,
                 "subject": subject,
@@ -366,7 +366,7 @@ def build_manifest(
                 "idempotency_key": f"{subject}|{section}",
             })
 
-        elif kind in ("incomplete_placeholder", "unresolved_option_bracket"):
+        elif kind == "incomplete_placeholder":
             # Anchor on the on-page placeholder token (stored in context); the
             # body page is the only candidate (no TOC drift to chase).
             token = r["context"] or ""

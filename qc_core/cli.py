@@ -348,7 +348,7 @@ def _format_finding(row: dict) -> str:
         ).rstrip()
     if kind == "spec_toc_absent":
         return f"  [info] {row.get('notes') or 'No specification TOC found.'}"
-    if kind in ("incomplete_placeholder", "unresolved_option_bracket"):
+    if kind == "incomplete_placeholder":
         return (
             f"  [{row.get('severity', 'medium')}] p.{row.get('body_page')} "
             f"\"{row.get('client_comment') or ''}\" — {row.get('context') or ''}"

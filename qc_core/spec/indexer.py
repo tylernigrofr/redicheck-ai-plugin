@@ -632,8 +632,8 @@ def _detect_incomplete_placeholders(conn: sqlite3.Connection) -> None:
     """Emit one callout per (volume, page, kind) for unfinished MasterSpec
     boilerplate (#61). A page repeating the same signal gets a "(typical)"
     callout; the first token anchors it. incomplete_placeholder (`<Insert …>`)
-    is high precision; unresolved_option_bracket is already gated at parse time
-    on same-line co-occurrence with an `<Insert …>`."""
+    is high precision; any option bracket sharing its line is folded into the
+    token at parse time (#86) rather than emitted as its own kind."""
     rows = conn.execute(
         "SELECT volume_id, page, kind, token FROM spec_placeholders "
         "ORDER BY volume_id, page, kind, id"
@@ -647,10 +647,7 @@ def _detect_incomplete_placeholders(conn: sqlite3.Connection) -> None:
 
     for (volume_id, page, kind), tokens in grouped.items():
         typical = len(tokens) > 1
-        if kind == "incomplete_placeholder":
-            comment = "Incomplete (typical)" if typical else "Incomplete"
-        else:
-            comment = "Delete, typical" if typical else "Delete"
+        comment = "Incomplete (typical)" if typical else "Incomplete"
         notes = (
             f"{len(tokens)} occurrence(s) on p.{page}; e.g. {tokens[0]}"
             if typical

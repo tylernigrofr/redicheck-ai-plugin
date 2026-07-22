@@ -10,6 +10,37 @@ description: >
 Drawing Index QC for RediCheck — cross-reference sheet indexes with title blocks
 in the Drawing Set.
 
+## The tool is decision support, not the verdict
+
+The findings list is a **lead generator** — a fast way to surface candidates so
+you don't read every sheet by hand. It is not ground truth, and a clean run is
+not a passed check. Extraction is imperfect: a discipline whose index is a
+flattened/rotated civil cover sheet, an inline `T100 Site Plan` index, or a
+sub-project bound into one PDF can yield zero parsed rows, which turns every
+sheet in that volume into false UNLISTED noise — and can equally *suppress* a
+real finding the comparison never got to make (e.g. a CNL discipline listed but
+never present, whose prefix the gate drops because no sheet of that prefix
+exists anywhere).
+
+So **apply your own judgment and do not trust the tool 100%**:
+
+- When a volume parsed **0 index rows** but clearly has sheets, treat the whole
+  volume's reconciliation as unverified and **open the PDF yourself** — find the
+  real index page, read it, and reconcile by eye. Do not report the resulting
+  UNLISTED flood as findings, and do not assume the absence of a finding means
+  the volume is clean.
+- The tool **cannot read revision-status tables** (sheets marked "never issued"
+  in the master index), **cross-prefix duplicate relationships** (two number
+  series that are the same sheets, e.g. KS vs MS), or anything raster. These are
+  yours to catch by reading the page.
+- Your job is to return a **judged, deduplicated list** — true CNL / UNLISTED /
+  duplicates separated from parse-gap noise, each grounded in what you saw on
+  the page — not to relay the raw grouped counts. The grouped output and the
+  scoreboard are inputs to that judgment, not the deliverable.
+- A high finding count almost always means a parse gap, not a bad drawing set.
+  Diagnose the gap (per-volume `extraction_signal`, `--show-index`,
+  `--show-bookmarks`, `--explain`) before reporting numbers.
+
 ## Usage
 
 Always invoke through the plugin venv — never rely on PATH resolution.

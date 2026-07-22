@@ -154,10 +154,10 @@ BODY_SECTION_HEADER_RE = re.compile(
 
 BODY_INDICATOR_RE = re.compile(
     r"^PART\s+1\s+GENERAL|^1\.\s*GENERAL|^PART\s+ONE",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 
-DIVISION_HEADER_RE = re.compile(r"^DIVISION\s+\d+", re.IGNORECASE)
+DIVISION_HEADER_RE = re.compile(r"^DIVISION\s+\d+", re.IGNORECASE | re.MULTILINE)
 
 RELATED_HEADER_RE = re.compile(
     r"RELATED\s+(?:SECTIONS?|DOCUMENTS?|WORK|REQUIREMENTS?)",
@@ -505,20 +505,46 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
 
             bare = is_bare_section_number(line)
             if bare:
-                norm = normalize_section_num(bare)
-                if norm and is_valid_csi_number(norm):
+                # Two-column TOC pages can interleave as a "column dump":
+                # [number, number, title, title] instead of strict
+                # [number, title, number, title] alternation (#B). Collect the
+                # whole run of consecutive bare numbers, then the run of
+                # title-like lines that follows, and pair them positionally
+                # (number[k] <-> title[k]) rather than requiring the very next
+                # line after each number to be its title.
+                numbers = []
+                j = i
+                while j < len(nonempty):
+                    _, cur_line = nonempty[j]
+                    cur_bare = is_bare_section_number(cur_line)
+                    if not cur_bare:
+                        break
+                    numbers.append(cur_bare)
+                    j += 1
+
+                titles: list[str] = []
+                k = j
+                while k < len(nonempty) and len(titles) < len(numbers):
+                    _, cand = nonempty[k]
+                    if (
+                        is_bare_section_number(cand)
+                        or DIVISION_HEADER_RE.match(cand)
+                        or re.match(r"^[.\s]+$", cand)
+                        or cand.lower() in ("section", "not used")
+                        or len(cand) <= 1
+                    ):
+                        break
+                    titles.append(cand)
+                    k += 1
+
+                for idx_num, raw_num in enumerate(numbers):
+                    norm = normalize_section_num(raw_num)
+                    if not (norm and is_valid_csi_number(norm)):
+                        continue
                     title = ""
-                    if i + 1 < len(nonempty):
-                        _, next_line = nonempty[i + 1]
-                        if (
-                            not is_bare_section_number(next_line)
-                            and not DIVISION_HEADER_RE.match(next_line)
-                            and not re.match(r"^[.\s]+$", next_line)
-                            and next_line.lower() not in ("section", "not used")
-                            and len(next_line) > 1
-                        ):
-                            title = re.sub(r"\s*\.{2,}.*$", "", next_line)
-                            title = re.sub(r"\s+\d{1,4}\s*$", "", title).strip()
+                    if idx_num < len(titles):
+                        title = re.sub(r"\s*\.{2,}.*$", "", titles[idx_num])
+                        title = re.sub(r"\s+\d{1,4}\s*$", "", title).strip()
                     key = (norm, normalize_title_for_dup(title))
                     if looks_like_toc_title(title) and key not in found:
                         found[key] = {
@@ -526,7 +552,7 @@ def extract_toc_sections(doc, toc_start: int, toc_end: int) -> list[dict]:
                             "title": title,
                             "toc_page": page_idx + 1,
                         }
-                i += 1
+                i = j
                 continue
 
             m = INLINE_SECTION_RE.search(line)
@@ -898,19 +924,25 @@ def extract_ref_link_text(after: str) -> Optional[str]:
 
 # Unfinished MasterSpec boilerplate (#61). An angle-bracket editor placeholder
 # (`<Insert thickness>`) is a high-precision "section is incomplete" signal. A
-# choose-one option bracket (`[jurisdiction]`) is only flagged when it shares a
-# line with an `<Insert ...>` — bare brackets also wrap legitimate unit
-# conversions (`[0.0187 inch (0.5 mm)]`), which must not be flagged.
+# choose-one option bracket (`[jurisdiction]`) sharing a line with an
+# `<Insert ...>` never gets its own callout (#86) — reviewers only ever place
+# one verdict per spot — so its text is folded into the placeholder's token
+# instead. Bare brackets with no `<Insert ...>` on the line also wrap
+# legitimate unit conversions (`[0.0187 inch (0.5 mm)]`), which must not be
+# flagged at all.
 _INSERT_PLACEHOLDER_RE = re.compile(r"<\s*Insert\b[^>]*>", re.IGNORECASE)
 _OPTION_BRACKET_RE = re.compile(r"\[[^\[\]]{1,80}\]")
 
 
 def extract_placeholders(doc, body_start: int) -> list[dict]:
-    """Scan body pages for incomplete-placeholder / unresolved-option residue.
+    """Scan body pages for incomplete-placeholder residue.
 
     Returns ``[{"page", "kind", "token"}]`` (1-based page) in reading order.
-    ``token`` is the on-page text used to anchor the callout. Option brackets
-    are emitted only on lines that also carry an ``<Insert ...>`` placeholder.
+    ``kind`` is always ``"incomplete_placeholder"``. ``token`` is the on-page
+    text used to anchor the callout — the `<Insert ...>` text, plus any
+    option-bracket text sharing its line appended (e.g.
+    ``"<Insert width> [36 inches]"``), so no information is lost even though
+    the bracket no longer gets its own finding.
     """
     out: list[dict] = []
     n = len(doc)
@@ -918,23 +950,23 @@ def extract_placeholders(doc, body_start: int) -> list[dict]:
         page = page_idx + 1
         for line in doc[page_idx].get_text().split("\n"):
             inserts = _INSERT_PLACEHOLDER_RE.findall(line)
+            if not inserts:
+                continue
+            brackets = [
+                re.sub(r"\s+", " ", m.group(0)).strip()
+                for m in _OPTION_BRACKET_RE.finditer(line)
+            ]
             for tok in inserts:
+                token = re.sub(r"\s+", " ", tok).strip()
+                if brackets:
+                    token = " ".join([token, *brackets])
                 out.append(
                     {
                         "page": page,
                         "kind": "incomplete_placeholder",
-                        "token": re.sub(r"\s+", " ", tok).strip(),
+                        "token": token,
                     }
                 )
-            if inserts:
-                for m in _OPTION_BRACKET_RE.finditer(line):
-                    out.append(
-                        {
-                            "page": page,
-                            "kind": "unresolved_option_bracket",
-                            "token": re.sub(r"\s+", " ", m.group(0)).strip(),
-                        }
-                    )
     return out
 
 

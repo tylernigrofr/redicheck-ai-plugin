@@ -13,5 +13,4 @@ SPEC_FINDING_KINDS = (
     "duplicate_section_number_and_name",
     "spec_toc_absent",
     "incomplete_placeholder",
-    "unresolved_option_bracket",
 )

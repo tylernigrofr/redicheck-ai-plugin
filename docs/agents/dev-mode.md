@@ -3,11 +3,17 @@
 When working **inside the redicheck-ai repo** (writing code, running tests, iterating on qc_core), invoke the CLI directly via the repo's own Python environment rather than the plugin venv:
 
 ```bash
-python -m qc_core.cli qc-index <project-folder>
-python -m qc_core.cli spec-check <project-folder> --mode=preview
-python -m qc_core.cli drawing-index-qc <project-folder> --mode=preview
-python -m qc_core.cli door-check <project-folder> --mode=preview
+python -m qc_core qc-index <project-folder>
+python -m qc_core spec-check <project-folder> --mode=preview
+python -m qc_core drawing-index-qc <project-folder> --mode=preview
+python -m qc_core door-check <project-folder> --mode=preview
 ```
+
+Invoke `python -m qc_core` (the package), not `python -m qc_core.cli`. The
+`cli` module is a library of `*_main` entry points with no `__main__` guard, so
+running it as a module imports and exits silently (0, no output). The
+`qc_core/__main__.py` dispatcher maps the subcommand names above to those entry
+points, matching the console scripts in `pyproject.toml`.
 
 `<project-folder>` is always an absolute path to an external project directory containing the target PDFs — not the repo itself.
 
