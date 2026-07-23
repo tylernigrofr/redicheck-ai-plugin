@@ -147,10 +147,39 @@ TOC_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Dash form (case-insensitive): "SECTION NN NN NN - Title", "Section NNNNNN -
+# Title" (inline prose ref), or a bare header with nothing (#95's dangling
+# dash) after the number. group(2) is the (possibly empty) title.
 BODY_SECTION_HEADER_RE = re.compile(
-    r"^(?:SECTION|DOCUMENT|DIVISION)\s+(\d{1,2}[-\s.]?\d{2}[-\s.]?\d{2,4}(?:\.\d+)?|\d+-\d{6}[A-Z]?(?:\.\d+)?)\s*(?:[-\u2013\u2014]\s*.+)?\s*$",
+    r"^(?:SECTION|DOCUMENT|DIVISION)\s+(\d{1,2}[-\s.]?\d{2}[-\s.]?\d{2,4}(?:\.\d+)?|\d+-\d{6}[A-Z]?(?:\.\d+)?)"
+    r"\s*(?:[-\u2013\u2014]\s*(.*))?$",
     re.IGNORECASE,
 )
+
+# Compressed MasterFormat body headers (#101) write no dash at all, e.g.
+# "SECTION 01 6000 PRODUCT REQUIREMENTS". Dropping the dash requirement from
+# BODY_SECTION_HEADER_RE outright would also swallow inline prose citations
+# like 'Section 033300 "Architectural Concrete" for...' (title-case keyword,
+# mixed-case title) as if they were headers, dropping their related-refs. A
+# genuine dash-less header is written in all-caps end to end, so this second
+# pattern is intentionally case-SENSITIVE (no re.IGNORECASE) and requires an
+# all-caps title (letters/digits/space/basic punctuation only).
+_CAPS_NO_DASH_BODY_SECTION_HEADER_RE = re.compile(
+    r"^(?:SECTION|DOCUMENT|DIVISION)\s+"
+    r"(\d{1,2}[-\s.]?\d{2}[-\s.]?\d{2,4}(?:\.\d+)?|\d+-\d{6}[A-Z]?(?:\.\d+)?)"
+    r"\s+([A-Z0-9][A-Z0-9 &,./'\-]*)$"
+)
+
+
+def _match_body_header(line: str) -> Optional["re.Match[str]"]:
+    """BODY_SECTION_HEADER_RE match, falling back to the strict all-caps
+    dash-less form (#101) when the dashed/case-insensitive form doesn't
+    match. Callers use .group(1) for the number and .group(2) for the title,
+    same as a direct BODY_SECTION_HEADER_RE match."""
+    m = BODY_SECTION_HEADER_RE.match(line)
+    if m:
+        return m
+    return _CAPS_NO_DASH_BODY_SECTION_HEADER_RE.match(line)
 
 BODY_INDICATOR_RE = re.compile(
     r"^PART\s+1\s+GENERAL|^1\.\s*GENERAL|^PART\s+ONE",
@@ -593,7 +622,7 @@ _SENTENCE_TITLE_RE = re.compile(r"\.\s+[A-Z][a-z]")
 # Running header that reliably encodes the page's true section, e.g.
 # "03 20 00 - 2" (section number followed by a per-section page counter).
 _RUNNING_HEADER_RE = re.compile(
-    r"^(\d{2}[\s.]\d{2}[\s.]\d{2}(?:\.\d+)?)\s*[-–—]\s*(\d+)$"
+    r"^(\d{2}[\s.]?\d{2}[\s.]?\d{2}(?:\.\d+)?)\s*[-–—]\s*(\d+)$"
 )
 # A real CSI body header is written all-caps ("SECTION 03 60 00 - TITLE"),
 # even when the number itself is wrong (a mis-numbered header — left for #44).
@@ -679,14 +708,27 @@ def _assign_occurrences(sections: list[dict]) -> list[dict]:
     return sections
 
 
-def extract_body_sections(doc, body_start: int) -> list[dict]:
+def extract_body_sections(
+    doc, body_start: int, front_matter_end: Optional[int] = None
+) -> list[dict]:
     # number -> first page seen, so a later page sharing the number is only kept
     # when the running header marks it as a genuine new section start (#45).
     first_page: dict[str, int] = {}
     occurrences: list[dict] = []
     n = len(doc)
 
-    for page_idx in range(body_start, n):
+    # Front matter (title page, seals page, etc.) can physically precede the
+    # TOC. Scan those pages too so such sections aren't structurally invisible
+    # to the TOC<->body diff (#94). Guard against re-ingesting the TOC's own
+    # pages by capping the pre-TOC range at front_matter_end (exclusive).
+    if front_matter_end and front_matter_end > 0:
+        page_indices = list(range(0, min(front_matter_end, body_start))) + list(
+            range(body_start, n)
+        )
+    else:
+        page_indices = list(range(body_start, n))
+
+    for page_idx in page_indices:
         text = doc[page_idx].get_text()
         lines = [line.strip() for line in text.split("\n")]
         nonempty = [line for line in lines if line]
@@ -697,7 +739,7 @@ def extract_body_sections(doc, body_start: int) -> list[dict]:
 
         found_section_this_page = False
         for line_i, line in enumerate(nonempty):
-            m = BODY_SECTION_HEADER_RE.match(line)
+            m = _match_body_header(line)
             if not m:
                 continue
             if found_section_this_page and line_i > 4:
@@ -751,18 +793,16 @@ def extract_body_sections(doc, body_start: int) -> list[dict]:
                     found_section_this_page = True
                     continue
 
-            dash_m = re.search(r"[-\u2013\u2014]\s*(.+)$", line.strip())
-            if dash_m:
-                title = dash_m.group(1).strip()
+            title = (m.group(2) or "").strip()
+            if title:
                 if _is_sentence_shape_title(title):
                     continue
             else:
-                title = ""
                 if line_i + 1 < len(nonempty):
                     candidate = nonempty[line_i + 1]
                     if (
                         not PART_HEADER_RE.match(candidate)
-                        and not BODY_SECTION_HEADER_RE.match(candidate)
+                        and not _match_body_header(candidate)
                         and len(candidate) > 2
                     ):
                         title = candidate
@@ -1051,7 +1091,7 @@ def analyze_pdf(
 
     body_start = toc_e + 1
     toc_secs = extract_toc_sections(doc, toc_s, toc_e)
-    body_secs = extract_body_sections(doc, body_start)
+    body_secs = extract_body_sections(doc, body_start, front_matter_end=toc_s)
     embedded_reports = detect_embedded_reports(doc)
     page_label_index = _build_page_label_index(doc)
     related_refs = extract_all_section_refs(doc, body_start, body_secs, page_label_index)

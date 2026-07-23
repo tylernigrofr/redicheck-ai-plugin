@@ -35,7 +35,14 @@ BOOKMARK_RE = re.compile(
     # bodies ("E-101", "A101-2ND FLOOR", "T24-1") backtrack it to empty and are
     # unchanged; the mandatory "[\d\.]+" still rejects letter-only titles
     # ("CD-SET NOTES").
-    r"^((?:\d{1,2}-)?(?:[A-Z]{1,4}-)?[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,3}(?![A-Za-z]))?[a-z]{0,4}(?:\.\d{1,2})?)(?:\s*[-–]\s*(.+))?",
+    # Alpha companion-sheet suffix "-\d{1,3}(?![A-Za-z])|-[A-Z]{1,3}(?![A-Za-z])":
+    # the digit form is #73's Title-24 shape; the alpha form ("-SE" — slab-edge
+    # companion sheets, #100) is glued the same way so A-100-SE stays distinct
+    # from A-100 instead of the normalizer's bookmark side dropping it into the
+    # title field (false duplicate_sheet_number). Both cap at 3 chars so a
+    # longer title glued without a space ("A-100-REVISED") still falls through
+    # to the title-split group untouched.
+    r"^((?:\d{1,2}-)?(?:[A-Z]{1,4}-)?[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,3}(?![A-Za-z])|-[A-Z]{1,3}(?![A-Za-z]))?[a-z]{0,4}(?:\.\d{1,2})?)(?:\s*[-–]\s*(.+))?",
     re.IGNORECASE,
 )
 # Bookmark `<NUMBER> - <TITLE>` delimiter: hyphen/en-dash with whitespace on
@@ -46,8 +53,10 @@ _BOOKMARK_DELIM_RE = re.compile(r"\s[-–]\s")
 # as BOOKMARK_RE's group 1 plus an optional trailing `-<digits>` segment
 # (T24-1, A2.1-3) and/or a `.N` sub-sheet suffix (A110A.1, #78), anchored at
 # both ends.
+# Mirrors BOOKMARK_RE's alpha-suffix alternation (#100) so a whole-token
+# bookmark line ("A-100-SE" with no title) is recognized too.
 _BOOKMARK_SHEET_RE = re.compile(
-    r"^(?:\d{1,2}-)?(?:[A-Z]{1,4}-)?[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,4})?[a-z]{0,4}(?:\.\d{1,2})?$",
+    r"^(?:\d{1,2}-)?(?:[A-Z]{1,4}-)?[A-Z]{1,4}[-\.]?[\d\.]+(?:-\d{1,4}|-[A-Z]{1,3})?[a-z]{0,4}(?:\.\d{1,2})?$",
     re.IGNORECASE,
 )
 
@@ -90,6 +99,28 @@ INDEX_PAGE_RE = re.compile(
     r"SHEET\s+LIST|LIST\s+OF\s+DRAWINGS"
     r"|[A-Z][A-Z\s/&]{1,40}?\s+INDEX"
     r")\b",
+    re.IGNORECASE,
+)
+# Discipline-NAMED header only ("CIVIL INDEX", "LANDSCAPE INDEX") — a closed
+# vocabulary (CONTEXT.md's RediCheck discipline groups + the synonyms already
+# recognized by discipline.py's title-hint table), NOT an open "any words +
+# INDEX" pattern. An open pattern false-positives on engineering-schedule
+# column headers that happen to end in the word "index" ("PUMP ENERGY INDEX"
+# on Lakeshore Center's mechanical equipment schedule, discovered calibrating
+# #100's discovery guard) — those must never be mistaken for a real
+# discipline index header. Used by the suppressed-discipline discovery guard
+# (#100 ask 2) as the hand-verifiable corroborating signal the issue itself
+# names: the index TEXT must literally print a known discipline word before
+# "INDEX".
+_DISCIPLINE_HEADER_WORDS = (
+    "CIVIL", "LANDSCAPE", "STRUCTURAL", "ARCHITECTURAL", "ELECTRICAL",
+    "MECHANICAL", "PLUMBING", "FIRE PROTECTION", "FOOD SERVICE",
+    "IRRIGATION", "HARDSCAPE", "TECHNOLOGY", "SECURITY", "COMMUNICATIONS",
+    "COMMUNICATION", "LOW VOLTAGE", "SURVEY", "GEOTECHNICAL",
+    "INTERIOR DESIGN", "INTERIORS", "AUDIO VISUAL",
+)
+_DISCIPLINE_NAMED_HEADER_RE = re.compile(
+    r"\b(?:" + "|".join(_DISCIPLINE_HEADER_WORDS) + r")\s+INDEX\b",
     re.IGNORECASE,
 )
 SHEET_TOKEN_RE = re.compile(
@@ -240,6 +271,11 @@ RASTER_PAGE_FRACTION = 0.5
 # itself is flattened. Electrical p.2 of 1300 W 218th: 796 chars.
 INDEX_PAGE_CHAR_FLOOR = 1000
 
+# Floor for the suppressed-discipline discovery guard (#100 ask 2) — mirrors
+# matrix.py's PREFIX_MIN_SHEETS so a single stray cross-discipline token isn't
+# treated as a whole named discipline.
+PREFIX_MIN_SHEETS = 3
+
 
 def compute_extraction_signal(
     page_char_counts: list[int],
@@ -364,6 +400,12 @@ _SHEET_CORE = (
     r"(?:"
     r"[A-Z]{1,4}-?\d{1,4}(?:[A-Za-z]{0,4}|\.(?:\d[A-Za-z0-9]{0,3}|[A-Za-z]{1,2})(?:\.(?:\d{1,3}|[A-Za-z]{1,2}))?)"
     r"|[A-Z]{1,4}\.\d{1,4}[A-Za-z]{0,3}"
+    # 4b. Dotted three-part scheme with NO digit before the first dot
+    #     (C.0.01, C.1.12, L.0.00, L.5.02 — 730 E. Cooper's Civil/Landscape
+    #     numbering, #100). Mirrors form 2's dot-led shape but requires a
+    #     SECOND dot segment of 2-3 digits, so it stays disjoint from form 2
+    #     (single dot, e.g. G.10, EN.1) and from form 1's digit-led bodies.
+    r"|[A-Z]{1,4}\.\d{1,2}\.\d{2,3}"
     # 3. prefix + digits + hyphen + digits (T24-1..T24-6 — Stockton's Title-24
     #    compliance sheets, #73). The hyphen segment is digit-led so prose
     #    fragments like "TITLE-A" can't qualify, and the prefix-digit body
@@ -1194,6 +1236,9 @@ def analyze_pdf(
         # Per-region raw capture for the layer model (#88), independent of the
         # strict per-prefix gate below.
         regions_captured: list[dict] = []
+        # #100 ask 2: prefixes the index text names with a real row run that
+        # never survived to a channel AND have zero bookmarks in this volume.
+        suppressed_discipline_candidates: list[dict] = []
 
         for header_pg in all_header_pages:
             if header_pg in covered_pages:
@@ -1244,6 +1289,80 @@ def analyze_pdf(
                 project_bookmark_prefixes,
                 project_sheet_keys=project_sheet_keys,
             )
+
+            # Suppressed-discipline discovery guard (#100 ask 2, cf. #87/#71).
+            #
+            # The dangerous case (730 E. Cooper's Landscape block) is a whole
+            # REGION the per-prefix gate rejects outright — its own
+            # header/continuation block names a discipline with no bookmarks
+            # anywhere in the volume, so nothing in it clears even the
+            # secondary-prefix admission rules. Scoping to "filtered came back
+            # completely empty" (not merely missing one prefix) is essential:
+            # Quarry Oaks' Civil index page mixes a handful of ST/LS/DT/AR
+            # legend/detail-reference tokens alongside its ~60 real C rows
+            # (documented noise in classify_index_scope above) — that region's
+            # `filtered` is NON-empty (C passes), so those secondary prefixes
+            # must stay exactly what _per_prefix_gate already calls them:
+            # "legend scrape, single-hit noise," not a suppressed discipline.
+            #
+            # Requires (a) filtered is empty — the whole region was rejected,
+            # (b) titled rows only — bare-token legend/schedule scrapes lack
+            # real titles, (c) the substantive-row floor also used by
+            # _find_continuation_pages (>= 5) so a thin legend block can't
+            # qualify, (d) zero bookmarks for the prefix PROJECT-WIDE when
+            # project context is available (stronger than merely this
+            # volume — a real missing discipline has no sheets anywhere in
+            # the set), and (e) the header page TEXT itself names a
+            # discipline ("LANDSCAPE INDEX", not just "SHEET INDEX") — the
+            # hand-verifiable signal issue #100 itself describes. Without
+            # this, a page whose real content the gate correctly rejected
+            # for unrelated reasons (a legend/schedule page mistaken for an
+            # index header, Lakeshore's "SE*" false positive) still floods.
+            header_names_discipline = bool(
+                _DISCIPLINE_NAMED_HEADER_RE.search(page_texts[header_pg - 1])
+                or _DISCIPLINE_NAMED_HEADER_RE.search(
+                    _collapse_letterspacing(page_texts[header_pg - 1])
+                )
+            )
+            SUBSTANTIVE_MIN = 5
+            volume_prefixes_here = {
+                m.group(1).upper()
+                for s in sheets
+                if (m := _SHEET_PREFIX_RE.match(s["sheet_number"]))
+            }
+            titled_raw = [r for r in region_raw if (r.get("title") or "").strip()]
+            from collections import Counter as _Counter
+
+            dominant_counts = _Counter(
+                m.group(1).upper()
+                for r in titled_raw
+                if (m := _SHEET_PREFIX_RE.match(r["sheet_number"]))
+            )
+            if not filtered and dominant_counts and header_names_discipline:
+                dom_prefix, dom_count = dominant_counts.most_common(1)[0]
+                zero_project_wide = (
+                    project_bookmark_prefixes is None
+                    or dom_prefix not in project_bookmark_prefixes
+                )
+                if (
+                    dom_count >= SUBSTANTIVE_MIN
+                    and dom_prefix not in volume_prefixes_here
+                    and zero_project_wide
+                ):
+                    suppressed_discipline_candidates.append(
+                        {
+                            "prefix": dom_prefix,
+                            "index_page": header_pg,
+                            "row_count": dom_count,
+                            "sample": [
+                                r["sheet_number"]
+                                for r in titled_raw
+                                if (m := _SHEET_PREFIX_RE.match(r["sheet_number"]))
+                                and m.group(1).upper() == dom_prefix
+                            ][:5],
+                        }
+                    )
+
             if filtered:
                 accepted_prefixes_here = {
                     m.group(1).upper()
@@ -1380,6 +1499,7 @@ def analyze_pdf(
             "titleblock_mismatches": tb_mismatches,
             "bookmark_anomalies": bookmark_anomalies,
             "index_anomalies": index_anomalies,
+            "suppressed_discipline_candidates": suppressed_discipline_candidates,
             "meta": {
                 "total_pages": doc.page_count,
                 "bookmark_parse_rate": round(parse_rate, 3),

@@ -8,4 +8,5 @@ DRAWING_FINDING_KINDS = (
     "sheet_discipline_reviewer_resolution",
     "parse_anomaly",
     "discipline_index_missing",
+    "suppressed_discipline_candidate",
 )

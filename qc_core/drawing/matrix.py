@@ -765,6 +765,83 @@ def tripped_scopes(conn: sqlite3.Connection) -> set[str]:
     return {r["scope"] for r in rows if r["scope"]}
 
 
+def link_parse_anomaly_cnl_evidence(conn: sqlite3.Connection) -> int:
+    """#97: cross-reference a same-volume parse_anomaly with a CNL it likely caused.
+
+    Triage decision on #97: no tolerant leading-token parsing (risks colliding
+    with #86's digit-led building prefixes, e.g. '6 8-A001' vs a genuine
+    '6-A001'). Instead, when a volume has a parse_anomaly (bookmark channel)
+    whose raw_text contains a token that normalizes to the same key as a
+    sheet_in_index_not_in_set CNL in that SAME volume, the linkage is written
+    onto the CNL's reconciliation_matrix row detail as Evidence — a Reviewer
+    reads the pair together and resolves it with one page read instead of
+    treating the anomaly and the CNL as two unrelated defects.
+
+    Returns the number of matrix rows updated.
+    """
+    anomalies = conn.execute(
+        "SELECT volume_id, raw_text FROM drawing_parse_anomalies WHERE channel = ?",
+        (CHANNEL_BOOKMARKS,),
+    ).fetchall()
+    if not anomalies:
+        return 0
+    cnl_rows = conn.execute(
+        "SELECT drawing_volume_id, sheet_number FROM findings "
+        "WHERE kind = 'sheet_in_index_not_in_set'"
+    ).fetchall()
+    if not cnl_rows:
+        return 0
+
+    anomalies_by_volume: dict[int, list[str]] = {}
+    for a in anomalies:
+        anomalies_by_volume.setdefault(a["volume_id"], []).append(a["raw_text"] or "")
+
+    updated = 0
+    for cnl in cnl_rows:
+        vol_id = cnl["drawing_volume_id"]
+        raw_texts = anomalies_by_volume.get(vol_id)
+        if not raw_texts:
+            continue
+        key = normalize_sheet_number(cnl["sheet_number"] or "")
+        if not key:
+            continue
+        for raw_text in raw_texts:
+            match = next(
+                (t for t in raw_text.split() if normalize_sheet_number(t) == key),
+                None,
+            )
+            if not match:
+                continue
+            matrix_rows = conn.execute(
+                "SELECT id, detail FROM reconciliation_matrix WHERE check_name = ? "
+                "AND entity_key = ? AND volume_id = ? AND channel != ?",
+                (CHECK_NAME, key, vol_id, CHANNEL_BOOKMARKS),
+            ).fetchall()
+            for mrow in matrix_rows:
+                try:
+                    detail = json.loads(mrow["detail"]) if mrow["detail"] else {}
+                except (TypeError, ValueError):
+                    detail = {}
+                detail["parse_anomaly_linkage"] = {
+                    "raw_text": raw_text,
+                    "matched_token": match,
+                    "note": (
+                        "Same-volume parse_anomaly raw text contains this "
+                        "CNL's key — likely a stray leading token before the "
+                        "real bookmark (#97), not a genuine missing sheet. "
+                        "Verify by reading the raw bookmark text before "
+                        "confirming the CNL."
+                    ),
+                }
+                conn.execute(
+                    "UPDATE reconciliation_matrix SET detail = ? WHERE id = ?",
+                    (json.dumps(detail), mrow["id"]),
+                )
+                updated += 1
+            break
+    return updated
+
+
 def _normalize_raw(text: str) -> str:
     """Strip, casefold, collapse internal whitespace for forgiving comparison."""
     import re

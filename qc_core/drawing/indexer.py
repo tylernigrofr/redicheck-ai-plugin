@@ -246,6 +246,10 @@ def index_drawing_pdf(
         conn.execute("DELETE FROM drawing_index_duplicates WHERE volume_id = ?", (volume_id,))
         conn.execute("DELETE FROM drawing_index_layers WHERE volume_id = ?", (volume_id,))
         conn.execute(
+            "DELETE FROM drawing_suppressed_discipline_candidates WHERE volume_id = ?",
+            (volume_id,),
+        )
+        conn.execute(
             """
             UPDATE drawing_volumes
             SET pdf_mtime = ?, page_count = ?, discipline = ?, set_pattern = ?,
@@ -352,6 +356,20 @@ def index_drawing_pdf(
              _json.dumps({k: v for k, v in anom.items() if k not in ("raw", "page", "channel")})),
         )
 
+    for cand in result.get("suppressed_discipline_candidates", []):
+        conn.execute(
+            "INSERT INTO drawing_suppressed_discipline_candidates "
+            "(volume_id, prefix, index_page, row_count, sample) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                volume_id,
+                cand["prefix"],
+                cand.get("index_page"),
+                cand["row_count"],
+                ",".join(cand.get("sample") or []),
+            ),
+        )
+
     for dup in result.get("index_duplicates", []):
         conn.execute(
             "INSERT INTO drawing_index_duplicates "
@@ -399,13 +417,23 @@ def _insert_finding(
     source_page: int | None = None,
     notes: str | None = None,
     expected_action: str = "emit_markup",
+    status: str | None = None,
 ) -> None:
+    # #96: a bare-short-token index row whose title reads as a cover-table
+    # field ("S1" / "CONSTRUCTION TYPE: VB"), not a sheet title, is flagged
+    # with an Evidence note on its CNL rather than suppressed by tightening
+    # the grammar (triage decision, issue #96) — Claude/Reviewer dismisses it
+    # from the note instead of the deterministic parser guessing wrong.
+    if kind == "sheet_in_index_not_in_set":
+        cover_note = _cover_table_row_note(sheet_number, title)
+        if cover_note:
+            notes = f"{notes}; {cover_note}" if notes else cover_note
     conn.execute(
         """
         INSERT INTO findings (
             drawing_volume_id, kind, expected_action, severity,
-            sheet_number, title, source_page, notes, evidence_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            sheet_number, title, source_page, notes, evidence_key, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'candidate'))
         """,
         (
             drawing_volume_id,
@@ -417,6 +445,7 @@ def _insert_finding(
             source_page,
             notes,
             normalize_sheet_number(sheet_number) if sheet_number else None,
+            status,
         ),
     )
 
@@ -426,9 +455,37 @@ def _severity_for_kind(kind: str) -> str:
         return "high"
     if kind == "sheet_number_mismatch":
         return "medium"
-    if kind in ("sheet_discipline_reviewer_resolution", "discipline_index_missing"):
+    if kind in (
+        "sheet_discipline_reviewer_resolution",
+        "discipline_index_missing",
+    ):
         return "low"
+    if kind == "suppressed_discipline_candidate":
+        return "high"
     return "medium"
+
+
+# #96: bare short sheet-number token (e.g. "S1", "M1" — up to 2 letters + up
+# to 2 digits, no dot/hyphen) whose title reads as a "KEY: VALUE" cover-table
+# field, not a sheet title. Calibrated on the garage G000 cover-table ground
+# truth ('S1', 'CONSTRUCTION TYPE: VB').
+_COVER_TABLE_BARE_TOKEN_RE = re.compile(r"^[A-Z]{1,2}\d{1,2}$")
+_COVER_TABLE_TITLE_RE = re.compile(r"^[A-Z0-9 /&\-]{2,50}:\s*\S")
+
+
+def _cover_table_row_note(sheet_number: str | None, title: str | None) -> str | None:
+    if not sheet_number or not title:
+        return None
+    sn = sheet_number.strip().upper()
+    if len(sn) > 4 or not _COVER_TABLE_BARE_TOKEN_RE.match(sn):
+        return None
+    if not _COVER_TABLE_TITLE_RE.match(title.strip()):
+        return None
+    return (
+        f"probable cover-table row (bare token '{sn}', title '{title.strip()}' "
+        "reads as a key:value field, not a sheet title) — verify before "
+        "treating as a real UNLISTED sheet (#96)"
+    )
 
 
 def _emit_sheet_discipline_review_findings(conn: sqlite3.Connection) -> None:
@@ -586,6 +643,40 @@ def _emit_discipline_index_missing_findings(conn: sqlite3.Connection) -> None:
             drawing_volume_id=vol_id,
             notes=f"prefix={prefix} sheets_in_set={count}",
             expected_action="emit_markup",
+        )
+
+
+def _emit_suppressed_discipline_findings(conn: sqlite3.Connection) -> None:
+    """Promote drawing_suppressed_discipline_candidates to findings (#100 ask 2).
+
+    A loud, evidence-status warning: the index named a discipline with a real
+    row run on its page, but that prefix never survived to a channel and has
+    zero bookmarks in the volume — the class #100 documents as a silently
+    suppressed whole-discipline CNL. Held at status='evidence' (not
+    'candidate') so it must be judged, the same discipline as parse_anomaly
+    (ADR-0027) — a discovery signal, not a concluded verdict.
+    """
+    rows = conn.execute(
+        "SELECT volume_id, prefix, index_page, row_count, sample "
+        "FROM drawing_suppressed_discipline_candidates "
+        "ORDER BY volume_id, prefix"
+    ).fetchall()
+    for row in rows:
+        _insert_finding(
+            conn,
+            kind="suppressed_discipline_candidate",
+            sheet_number=f"{row['prefix']}*",
+            drawing_volume_id=row["volume_id"],
+            source_page=row["index_page"],
+            notes=(
+                f"prefix={row['prefix']} index_rows={row['row_count']} "
+                f"sample={row['sample'] or ''} — discipline named on the "
+                "index page produced real index rows here but zero "
+                "bookmarks exist for this prefix in the set; verify whether "
+                "this is a whole-discipline CNL before dismissing (#100)."
+            ),
+            expected_action="info_only",
+            status="evidence",
         )
 
 
@@ -1167,6 +1258,8 @@ def compute_drawing_findings(conn: sqlite3.Connection) -> None:
     _emit_parse_anomaly_findings(conn)
     _emit_index_duplicate_findings(conn)
     _emit_discipline_index_missing_findings(conn)
+    _emit_suppressed_discipline_findings(conn)
+    drawing_matrix.link_parse_anomaly_cnl_evidence(conn)
 
     # Hold baseline verdicts on untrusted scopes at Evidence (ADR-0026 §6a):
     # a tripped invariant means parse-completeness on that prefix is suspect,

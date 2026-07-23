@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 MIGRATIONS_PACKAGE = "qc_core.migrations"
-LATEST_MIGRATION = 17
+LATEST_MIGRATION = 18
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -38,6 +38,7 @@ _MIGRATION_FILES = {
     15: "0015_index_duplicates.sql",
     16: "0016_building_prefix.sql",
     17: "0017_index_layers.sql",
+    18: "0018_suppressed_discipline_candidates.sql",
 }
 
 
